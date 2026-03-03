@@ -42,7 +42,7 @@ class BearerAuthMiddleware(Middleware):
 
 mcp = FastMCP(
     "Memory Server",
-    description="Personal semantic memory layer. Store and search memories across all your AI tools.",
+    instructions="Personal semantic memory layer. Store and search memories across all your AI tools.",
     middleware=[BearerAuthMiddleware()],
 )
 
