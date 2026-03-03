@@ -31,9 +31,31 @@ services:
       - default
       - caddy_rev-proxy
 
+  capture:
+    build:
+      context: .
+      dockerfile: Dockerfile.capture
+    container_name: mcp-memory-capture
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_started
+    environment:
+      SIMPLEX_WS_URL: ${SIMPLEX_WS_URL:-ws://simplex-cli:5225}
+      SIMPLEX_HTTP_URL: ${SIMPLEX_HTTP_URL:-http://simplex-cli:5226}
+      MEMORY_WEBHOOK_URL: ${MEMORY_WEBHOOK_URL:-http://mcp-memory-server:8000/webhook/capture}
+      MCP_API_KEY: ${MCP_API_KEY}
+      BRAIN_GROUP: ${BRAIN_GROUP:-Brain}
+      DEBUG: ${DEBUG:-0}
+    networks:
+      - default
+      - simplex-sizzle_default
+
 volumes:
   mcp-memory-pgdata:
 
 networks:
   caddy_rev-proxy:
+    external: true
+  simplex-sizzle_default:
     external: true
