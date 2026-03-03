@@ -76,45 +76,36 @@ def format_confirmation(result: dict) -> str:
 def extract_message(event: dict) -> tuple[str, str] | None:
     """Extract (group_name, message_text) from a SimpleX WebSocket event.
 
-    The SimpleX WebSocket event format varies by CLI version. This function
-    handles known formats and logs unrecognized events in debug mode.
-
-    Known event structures:
-    - {"resp": {"type": "contactMessage", ...}}
-    - {"resp": {"type": "groupMessage", "group": {"displayName": ...}, "chatMessage": {"content": {"text": ...}}}}
-    - {"event": "message", "group": ..., "text": ...}
+    Confirmed event structure (SimpleX CLI v6, WebSocket API):
+    {
+      "resp": {
+        "type": "newChatItems",
+        "chatItems": [{
+          "chatInfo": {"type": "group", "groupInfo": {"localDisplayName": "Brain", ...}},
+          "chatItem": {"content": {"msgContent": {"type": "text", "text": "..."}}}
+        }]
+      }
+    }
     """
-    # Try nested resp format (SimpleX CLI v5+)
-    resp = event.get("resp") or event.get("result") or {}
+    resp = event.get("resp", {})
 
-    if isinstance(resp, dict):
-        resp_type = resp.get("type", "")
+    if resp.get("type") != "newChatItems":
+        return None
 
-        # Group message format
-        if "group" in resp_type.lower() or "group" in resp:
-            group = resp.get("group") or resp.get("groupInfo") or {}
-            group_name = (
-                group.get("displayName")
-                or group.get("groupProfile", {}).get("displayName")
-                or ""
-            )
+    for item in resp.get("chatItems", []):
+        chat_info = item.get("chatInfo", {})
+        if chat_info.get("type") != "group":
+            continue
 
-            # Extract message text from various content structures
-            chat_msg = resp.get("chatMessage") or resp.get("chatItem", {}).get("chatMessage") or {}
-            content = chat_msg.get("content") or chat_msg.get("msgContent") or {}
-            text = content.get("text", "")
+        group_name = chat_info.get("groupInfo", {}).get("localDisplayName", "")
 
-            if not text:
-                # Try alternative content path
-                msg_content = resp.get("msgContent") or resp.get("content") or {}
-                text = msg_content.get("text", "")
+        chat_item = item.get("chatItem", {})
+        content = chat_item.get("content", {})
+        msg_content = content.get("msgContent", {})
+        text = msg_content.get("text", "")
 
-            if group_name and text:
-                return (group_name, text)
-
-    # Try flat event format
-    if "group" in event and "text" in event:
-        return (event["group"], event["text"])
+        if group_name and text:
+            return (group_name, text)
 
     return None
 
@@ -139,8 +130,6 @@ async def monitor():
 
                     if DEBUG:
                         logger.debug("RAW EVENT: %s", json.dumps(event, indent=2)[:2000])
-                        if event.get("resp", {}).get("type") == "newChatItems":
-                            logger.info("FULL newChatItems: %s", json.dumps(event))
 
                     parsed = extract_message(event)
                     if parsed is None:
