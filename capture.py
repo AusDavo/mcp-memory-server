@@ -139,6 +139,8 @@ async def monitor():
 
                     if DEBUG:
                         logger.debug("RAW EVENT: %s", json.dumps(event, indent=2)[:2000])
+                        if event.get("resp", {}).get("type") == "newChatItems":
+                            logger.info("FULL newChatItems: %s", json.dumps(event))
 
                     parsed = extract_message(event)
                     if parsed is None:
