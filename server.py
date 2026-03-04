@@ -8,11 +8,10 @@ from uuid import UUID
 import asyncpg
 import httpx
 from fastmcp import FastMCP
-from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.server.dependencies import get_http_headers
-from fastmcp.exceptions import ToolError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.middleware import Middleware as StarletteMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ─── Configuration ───────────────────────────────────────────────────────
 
@@ -23,24 +22,36 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 
 logger = logging.getLogger("memory-server")
 
-# ─── Authentication Middleware ───────────────────────────────────────────
+# ─── Authentication Middleware (Starlette layer) ────────────────────────
 
 
-class BearerAuthMiddleware(Middleware):
-    """Validates Bearer token on every tool call."""
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Validates Bearer token at the HTTP layer, before FastMCP processes the request.
 
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-        headers = get_http_headers()
-        auth_header = headers.get("authorization", "")
+    Works around a FastMCP bug where get_http_headers() returns stale/missing
+    headers during tool execution with the Streamable HTTP transport.
+    See: https://github.com/jlowin/fastmcp/issues/1233
+    """
 
+    async def dispatch(self, request: Request, call_next):
+        # Skip auth for health checks / OPTIONS preflight
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        auth_header = request.headers.get("authorization", "")
         if not auth_header.startswith("Bearer "):
-            raise ToolError("Unauthorized: missing or malformed Bearer token")
+            return JSONResponse(
+                {"error": "Unauthorized: missing or malformed Bearer token"},
+                status_code=401,
+            )
 
         token = auth_header.removeprefix("Bearer ").strip()
         if token != MCP_API_KEY:
-            raise ToolError("Unauthorized: invalid API key")
+            return JSONResponse(
+                {"error": "Unauthorized: invalid API key"}, status_code=401
+            )
 
-        return await call_next(context)
+        return await call_next(request)
 
 
 # ─── MCP Server ──────────────────────────────────────────────────────────
@@ -48,7 +59,6 @@ class BearerAuthMiddleware(Middleware):
 mcp = FastMCP(
     "Memory Server",
     instructions="Personal semantic memory layer. Store and search memories across all your AI tools.",
-    middleware=[BearerAuthMiddleware()],
 )
 
 # ─── Database Pool ───────────────────────────────────────────────────────
@@ -477,15 +487,10 @@ async def memory_stats() -> str:
 
 @mcp.custom_route("/webhook/capture", methods=["POST"])
 async def capture_webhook(request: Request) -> JSONResponse:
-    """REST endpoint for external capture sources (web form, scripts, etc.)."""
-    auth_header = request.headers.get("authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    """REST endpoint for external capture sources (web form, scripts, etc.).
 
-    token = auth_header.removeprefix("Bearer ").strip()
-    if token != MCP_API_KEY:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-
+    Auth is handled by the Starlette BearerAuthMiddleware.
+    """
     try:
         body = await request.json()
     except Exception:
@@ -552,4 +557,9 @@ def quick_capture(text: str, context: str = "") -> str:
 # ─── Entry Point ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    mcp.run(
+        transport="http",
+        host="0.0.0.0",
+        port=8000,
+        middleware=[StarletteMiddleware(BearerAuthMiddleware)],
+    )
