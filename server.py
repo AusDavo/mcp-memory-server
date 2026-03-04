@@ -477,7 +477,7 @@ async def memory_stats() -> str:
 
 @mcp.custom_route("/webhook/capture", methods=["POST"])
 async def capture_webhook(request: Request) -> JSONResponse:
-    """REST endpoint for external capture sources (e.g. SimpleX)."""
+    """REST endpoint for external capture sources (web form, scripts, etc.)."""
     auth_header = request.headers.get("authorization", "")
     if not auth_header.startswith("Bearer "):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
