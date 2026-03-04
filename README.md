@@ -127,6 +127,10 @@ Every `store_memory` call runs GPT-4o-mini in parallel with embedding generation
 
 AI metadata is stored under `metadata.ai` in the JSONB column, keeping it separate from user-supplied metadata. If extraction fails for any reason, the memory is still stored normally.
 
+## Authentication note
+
+Authentication uses a Starlette `BaseHTTPMiddleware` that validates the Bearer token at the HTTP layer, before FastMCP processes the request. This works around a [known FastMCP bug](https://github.com/jlowin/fastmcp/issues/1233) where `get_http_headers()` returns stale or missing headers during tool execution with the Streamable HTTP transport. If FastMCP's own middleware sees your headers correctly in a future release, you could switch back — but the Starlette approach is arguably more correct anyway since auth belongs at the transport layer.
+
 ## Docker networking note
 
 The server container needs to be on your reverse proxy's Docker network so the proxy can reach it. The database container should stay on the default (internal) network only. If both containers share a network with other stacks, use explicit `container_name` values and reference those in `DATABASE_URL` to avoid DNS collisions with common service names like `db`.
