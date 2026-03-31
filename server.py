@@ -669,6 +669,120 @@ async def memory_stats() -> str:
     )
 
 
+@mcp.tool()
+async def find_related(
+    threshold: float = 0.85,
+    tags: list[str] | None = None,
+    limit: int = 50,
+) -> str:
+    """
+    Find clusters of related memories that may be candidates for consolidation.
+
+    Args:
+        threshold: Minimum cosine similarity to consider related (default 0.85, range 0.7-0.95).
+        tags: Optional tag filter — only consider memories with ALL of these tags.
+        limit: Maximum number of pairs to analyze (default 50).
+
+    Returns:
+        Clusters of related memories with similarity scores and content previews.
+        Use update_memory to merge and delete_memory to remove redundant entries.
+    """
+    db = await get_pool()
+    threshold = max(0.7, min(0.95, threshold))
+    limit = min(limit, 200)
+
+    conditions = ["m1.id < m2.id"]
+    params: list = [threshold, limit]
+    param_idx = 3
+
+    if tags:
+        normalized = [t.lower().strip() for t in tags]
+        conditions.append(f"m1.tags @> ${param_idx}::text[]")
+        conditions.append(f"m2.tags @> ${param_idx}::text[]")
+        params.append(normalized)
+        param_idx += 1
+
+    where_clause = " AND ".join(conditions)
+
+    rows = await db.fetch(
+        f"""
+        SELECT
+            m1.id AS id_a, m1.content AS content_a, m1.tags AS tags_a, m1.created_at AS created_a,
+            m2.id AS id_b, m2.content AS content_b, m2.tags AS tags_b, m2.created_at AS created_b,
+            1 - (m1.embedding <=> m2.embedding) AS similarity
+        FROM memories m1
+        JOIN memories m2 ON {where_clause}
+            AND 1 - (m1.embedding <=> m2.embedding) >= $1
+        ORDER BY similarity DESC
+        LIMIT $2
+        """,
+        *params,
+    )
+
+    if not rows:
+        return json.dumps({"threshold": threshold, "clusters": [], "total_clusters": 0, "total_memories_in_clusters": 0})
+
+    # Union-find clustering
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        parent[find(a)] = find(b)
+
+    # Collect memory details and pairs
+    memory_details: dict[str, dict] = {}
+    pair_list: list[dict] = []
+
+    for row in rows:
+        id_a, id_b = str(row["id_a"]), str(row["id_b"])
+        union(id_a, id_b)
+        pair_list.append({"id_a": id_a, "id_b": id_b, "similarity": round(float(row["similarity"]), 4)})
+
+        if id_a not in memory_details:
+            memory_details[id_a] = {
+                "id": id_a, "content_preview": row["content_a"][:200],
+                "tags": row["tags_a"], "created_at": row["created_a"].isoformat(),
+            }
+        if id_b not in memory_details:
+            memory_details[id_b] = {
+                "id": id_b, "content_preview": row["content_b"][:200],
+                "tags": row["tags_b"], "created_at": row["created_b"].isoformat(),
+            }
+
+    # Group by cluster root
+    clusters_map: dict[str, list[str]] = {}
+    for mem_id in memory_details:
+        root = find(mem_id)
+        clusters_map.setdefault(root, []).append(mem_id)
+
+    # Build output, sorted by cluster size descending
+    clusters = []
+    for members in sorted(clusters_map.values(), key=len, reverse=True):
+        if len(members) < 2:
+            continue
+        cluster_pairs = [p for p in pair_list if p["id_a"] in members and p["id_b"] in members]
+        clusters.append({
+            "size": len(members),
+            "memories": [memory_details[m] for m in sorted(members, key=lambda m: memory_details[m]["created_at"])],
+            "pairs": sorted(cluster_pairs, key=lambda p: p["similarity"], reverse=True),
+        })
+
+    return json.dumps(
+        {
+            "threshold": threshold,
+            "clusters": clusters,
+            "total_clusters": len(clusters),
+            "total_memories_in_clusters": sum(c["size"] for c in clusters),
+        },
+        cls=MemoryEncoder,
+    )
+
+
 # ─── Webhook Endpoint ───────────────────────────────────────────────────
 
 
