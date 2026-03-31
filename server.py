@@ -18,7 +18,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 MCP_API_KEY = os.environ["MCP_API_KEY"]
-EMBEDDING_MODEL = "text-embedding-3-small"
+DUPLICATE_THRESHOLD = float(os.environ.get("DUPLICATE_THRESHOLD", "0.95"))
+
+# Embedding provider (defaults to OpenAI — any OpenAI-compatible API works)
+EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", OPENAI_API_KEY)
+EMBEDDING_API_URL = os.environ.get("EMBEDDING_API_URL", "https://api.openai.com/v1/embeddings")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 
 logger = logging.getLogger("memory-server")
 
@@ -64,6 +69,7 @@ mcp = FastMCP(
 # ─── Database Pool ───────────────────────────────────────────────────────
 
 db_pool: asyncpg.Pool | None = None
+_http_client: httpx.AsyncClient | None = None
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -73,24 +79,30 @@ async def get_pool() -> asyncpg.Pool:
     return db_pool
 
 
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            headers={"Content-Type": "application/json"},
+            timeout=30.0,
+        )
+    return _http_client
+
+
 # ─── Embedding Helper ───────────────────────────────────────────────────
 
 
 async def get_embedding(text: str) -> list[float]:
-    """Call OpenAI API to generate embedding for the given text."""
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"model": EMBEDDING_MODEL, "input": text},
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["data"][0]["embedding"]
+    """Generate embedding via the configured provider (OpenAI-compatible API)."""
+    client = get_http_client()
+    response = await client.post(
+        EMBEDDING_API_URL,
+        headers={"Authorization": f"Bearer {EMBEDDING_API_KEY}"},
+        json={"model": EMBEDDING_MODEL, "input": text},
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["data"][0]["embedding"]
 
 
 # ─── AI Metadata Extraction ─────────────────────────────────────────────
@@ -102,37 +114,34 @@ async def extract_metadata(content: str) -> dict:
     Best-effort: returns {} on any failure. Never blocks storage.
     """
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You extract structured metadata from text. "
-                                "Respond with JSON containing:\n"
-                                '- "type": one of "observation", "task", "idea", "reference", "person_note"\n'
-                                '- "topic_tags": 1-3 short lowercase tags (e.g. ["meeting", "acme-corp"])\n'
-                                '- "entities": {"people": [], "places": [], "organizations": []}\n'
-                                '- "action_items": list of actionable items (empty list if none)\n'
-                                "Be concise. Tags should be kebab-case."
-                            ),
-                        },
-                        {"role": "user", "content": content},
-                    ],
-                },
-                timeout=15.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-            return json.loads(data["choices"][0]["message"]["content"])
+        client = get_http_client()
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": "gpt-4o-mini",
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You extract structured metadata from text. "
+                            "Respond with JSON containing:\n"
+                            '- "type": one of "observation", "task", "idea", "reference", "person_note"\n'
+                            '- "topic_tags": 1-3 short lowercase tags (e.g. ["meeting", "acme-corp"])\n'
+                            '- "entities": {"people": [], "places": [], "organizations": []}\n'
+                            '- "action_items": list of actionable items (empty list if none)\n'
+                            "Be concise. Tags should be kebab-case."
+                        ),
+                    },
+                    {"role": "user", "content": content},
+                ],
+            },
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return json.loads(data["choices"][0]["message"]["content"])
     except Exception as e:
         logger.warning("Metadata extraction failed: %s", e)
         return {}
@@ -158,10 +167,11 @@ async def _store_memory_impl(
     source: str = "manual",
     tags: list[str] | None = None,
     metadata: dict | None = None,
+    force: bool = False,
 ) -> dict:
     """Core storage logic shared by the MCP tool and webhook endpoint."""
     db = await get_pool()
-    tags = tags or []
+    tags = [t.lower().strip() for t in (tags or [])]
     metadata = metadata or {}
 
     # Run embedding and AI metadata extraction in parallel
@@ -170,8 +180,29 @@ async def _store_memory_impl(
         extract_metadata(content),
     )
 
+    # Check for near-duplicate before inserting
+    if not force:
+        existing = await db.fetchrow(
+            """
+            SELECT id, content, created_at,
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM memories
+            ORDER BY embedding <=> $1::vector
+            LIMIT 1
+            """,
+            str(embedding),
+        )
+        if existing and float(existing["similarity"]) >= DUPLICATE_THRESHOLD:
+            return {
+                "status": "duplicate_detected",
+                "existing_id": str(existing["id"]),
+                "similarity": round(float(existing["similarity"]), 4),
+                "existing_content_preview": existing["content"][:200],
+                "created_at": existing["created_at"].isoformat(),
+            }
+
     # Merge AI-generated tags with user-supplied tags (deduplicated)
-    ai_tags = ai_metadata.pop("topic_tags", [])
+    ai_tags = [t.lower().strip() for t in ai_metadata.pop("topic_tags", [])]
     merged_tags = list(dict.fromkeys(tags + ai_tags))
 
     # Store AI metadata under 'ai' key (never conflicts with user keys)
@@ -210,6 +241,7 @@ async def store_memory(
     source: str = "manual",
     tags: list[str] | None = None,
     metadata: dict | None = None,
+    force: bool = False,
 ) -> str:
     """
     Store a new memory with automatic semantic embedding.
@@ -219,11 +251,12 @@ async def store_memory(
         source: Where this memory came from (e.g. 'claude-code', 'user', 'meeting').
         tags: Optional list of tags for categorical filtering (e.g. ['project-x', 'decision']).
         metadata: Optional JSON metadata (e.g. {'project': 'website-redesign', 'priority': 'high'}).
+        force: Skip duplicate detection and store regardless (default False).
 
     Returns:
         Confirmation with the memory ID.
     """
-    result = await _store_memory_impl(content, source, tags, metadata)
+    result = await _store_memory_impl(content, source, tags, metadata, force=force)
     return json.dumps(result)
 
 
@@ -251,12 +284,12 @@ async def search_memory(
     embedding = await get_embedding(query)
 
     conditions = []
-    params = [str(embedding), limit]
-    param_idx = 3
+    params = [str(embedding), limit, query]
+    param_idx = 4
 
     if tags:
         conditions.append(f"tags @> ${param_idx}::text[]")
-        params.append(tags)
+        params.append([t.lower().strip() for t in tags])
         param_idx += 1
 
     if source:
@@ -270,11 +303,19 @@ async def search_memory(
 
     rows = await db.fetch(
         f"""
-        SELECT id, content, source, tags, metadata, created_at,
-               1 - (embedding <=> $1::vector) AS similarity
-        FROM memories
-        {where_clause}
-        ORDER BY embedding <=> $1::vector
+        WITH candidates AS (
+            SELECT id, content, source, tags, metadata, created_at,
+                   1 - (embedding <=> $1::vector) AS vector_score,
+                   ts_rank_cd(to_tsvector('english', content), plainto_tsquery('english', $3)) AS fts_score
+            FROM memories
+            {where_clause}
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2 * 3
+        )
+        SELECT *,
+               vector_score * 0.7 + fts_score * 0.3 AS combined_score
+        FROM candidates
+        ORDER BY combined_score DESC
         LIMIT $2
         """,
         *params,
@@ -287,7 +328,9 @@ async def search_memory(
             "source": row["source"],
             "tags": row["tags"],
             "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-            "similarity": round(float(row["similarity"]), 4),
+            "similarity": round(float(row["combined_score"]), 4),
+            "vector_score": round(float(row["vector_score"]), 4),
+            "fts_score": round(float(row["fts_score"]), 4),
             "created_at": row["created_at"].isoformat(),
         }
         for row in rows
@@ -360,6 +403,111 @@ async def delete_memory(memory_id: str) -> str:
         return json.dumps({"status": "deleted", "id": memory_id})
     else:
         return json.dumps({"status": "not_found", "id": memory_id})
+
+
+@mcp.tool()
+async def update_memory(
+    memory_id: str,
+    content: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict | None = None,
+) -> str:
+    """
+    Update an existing memory. Re-embeds automatically if content changes.
+
+    Args:
+        memory_id: The UUID of the memory to update.
+        content: New content (triggers re-embedding). Leave empty to keep existing.
+        tags: New tags (replaces existing). Leave empty to keep existing.
+        metadata: New metadata (merged with existing). Leave empty to keep existing.
+
+    Returns:
+        Updated memory details, or not_found if the ID doesn't exist.
+    """
+    db = await get_pool()
+
+    existing = await db.fetchrow(
+        "SELECT id, content, tags, metadata FROM memories WHERE id = $1",
+        memory_id,
+    )
+    if not existing:
+        return json.dumps({"status": "not_found", "id": memory_id})
+
+    set_clauses = ["updated_at = NOW()"]
+    params: list = [memory_id]  # $1
+    idx = 2
+
+    if content is not None and content != existing["content"]:
+        embedding, ai_metadata = await asyncio.gather(
+            get_embedding(content),
+            extract_metadata(content),
+        )
+        ai_tags = [t.lower().strip() for t in ai_metadata.pop("topic_tags", [])]
+
+        # If caller also provided tags, use those + AI tags; otherwise use existing + AI tags
+        if tags is not None:
+            new_tags = list(dict.fromkeys(
+                [t.lower().strip() for t in tags] + ai_tags
+            ))
+        else:
+            new_tags = list(dict.fromkeys(
+                (existing["tags"] or []) + ai_tags
+            ))
+
+        set_clauses.append(f"content = ${idx}")
+        params.append(content)
+        idx += 1
+        set_clauses.append(f"embedding = ${idx}::vector")
+        params.append(str(embedding))
+        idx += 1
+        set_clauses.append(f"tags = ${idx}")
+        params.append(new_tags)
+        idx += 1
+
+        # Merge AI metadata into existing
+        existing_meta = json.loads(existing["metadata"]) if existing["metadata"] else {}
+        if metadata:
+            existing_meta.update(metadata)
+        if ai_metadata:
+            existing_meta["ai"] = ai_metadata
+        set_clauses.append(f"metadata = ${idx}::jsonb")
+        params.append(json.dumps(existing_meta))
+        idx += 1
+    else:
+        # No content change — handle tags and metadata independently
+        if tags is not None:
+            set_clauses.append(f"tags = ${idx}")
+            params.append([t.lower().strip() for t in tags])
+            idx += 1
+
+        if metadata is not None:
+            existing_meta = json.loads(existing["metadata"]) if existing["metadata"] else {}
+            existing_meta.update(metadata)
+            set_clauses.append(f"metadata = ${idx}::jsonb")
+            params.append(json.dumps(existing_meta))
+            idx += 1
+
+    if len(set_clauses) == 1:
+        return json.dumps({"status": "no_changes", "id": memory_id})
+
+    row = await db.fetchrow(
+        f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = $1 RETURNING id, content, source, tags, metadata, created_at, updated_at",
+        *params,
+    )
+
+    return json.dumps(
+        {
+            "status": "updated",
+            "id": str(row["id"]),
+            "content_preview": row["content"][:200],
+            "source": row["source"],
+            "tags": row["tags"],
+            "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+            "created_at": row["created_at"].isoformat(),
+            "updated_at": row["updated_at"].isoformat(),
+        },
+        cls=MemoryEncoder,
+    )
 
 
 @mcp.tool()

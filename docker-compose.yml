@@ -27,6 +27,10 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       MCP_API_KEY: ${MCP_API_KEY}
+      DUPLICATE_THRESHOLD: ${DUPLICATE_THRESHOLD:-0.95}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL:-https://api.openai.com/v1/embeddings}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
     networks:
       - default
       - caddy_rev-proxy
