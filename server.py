@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import contextvars
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -17,7 +18,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-MCP_API_KEY = os.environ["MCP_API_KEY"]
 DUPLICATE_THRESHOLD = float(os.environ.get("DUPLICATE_THRESHOLD", "0.95"))
 
 # Embedding provider (defaults to OpenAI — any OpenAI-compatible API works)
@@ -27,12 +27,44 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 
 logger = logging.getLogger("memory-server")
 
+# ─── Multi-Token Auth ───────────────────────────────────────────────────
+# Build a mapping of token → forced source.
+#   MCP_API_KEY          → primary key, no source override (None)
+#   MCP_API_KEY_<NAME>   → scoped key, forces source to lowercase <NAME>
+#
+# Example: MCP_API_KEY_KLAW=abc123 means token "abc123" forces source="klaw"
+
+TOKEN_SOURCE_MAP: dict[str, str | None] = {}
+
+_primary_key = os.environ.get("MCP_API_KEY", "")
+if _primary_key:
+    TOKEN_SOURCE_MAP[_primary_key] = None  # No source override
+
+for key, value in os.environ.items():
+    if key.startswith("MCP_API_KEY_") and value:
+        source_name = key.removeprefix("MCP_API_KEY_").lower()
+        TOKEN_SOURCE_MAP[value] = source_name
+
+logger.info(
+    "Loaded %d API key(s): %s",
+    len(TOKEN_SOURCE_MAP),
+    ", ".join(
+        f"{s or 'primary'}" for s in TOKEN_SOURCE_MAP.values()
+    ),
+)
+
+# Context variable to carry the forced source from middleware → tool
+auth_source_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "auth_source_override", default=None
+)
+
 # ─── Authentication Middleware (Starlette layer) ────────────────────────
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validates Bearer token at the HTTP layer, before FastMCP processes the request.
 
+    Supports multiple API keys with per-key source overrides.
     Works around a FastMCP bug where get_http_headers() returns stale/missing
     headers during tool execution with the Streamable HTTP transport.
     See: https://github.com/jlowin/fastmcp/issues/1233
@@ -51,11 +83,13 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header.removeprefix("Bearer ").strip()
-        if token != MCP_API_KEY:
+        if token not in TOKEN_SOURCE_MAP:
             return JSONResponse(
                 {"error": "Unauthorized: invalid API key"}, status_code=401
             )
 
+        # Set the source override for this request's async context
+        auth_source_override.set(TOKEN_SOURCE_MAP[token])
         return await call_next(request)
 
 
@@ -170,6 +204,11 @@ async def _store_memory_impl(
     force: bool = False,
 ) -> dict:
     """Core storage logic shared by the MCP tool and webhook endpoint."""
+    # Apply source override from scoped API key (if any)
+    forced_source = auth_source_override.get()
+    if forced_source is not None:
+        source = forced_source
+
     db = await get_pool()
     tags = [t.lower().strip() for t in (tags or [])]
     metadata = metadata or {}
