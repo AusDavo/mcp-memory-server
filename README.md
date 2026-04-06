@@ -16,18 +16,23 @@ Phone/browser ──HTTPS───────┘                  ▼
 
 - **Database**: Postgres 17 with pgvector — stores text alongside 1536-dimension vector embeddings
 - **Server**: Python 3.13 + FastMCP — Streamable HTTP transport with Bearer token auth
-- **Embeddings**: OpenAI `text-embedding-3-small` for vector generation
+- **Embeddings**: OpenAI `text-embedding-3-small` by default, configurable to any OpenAI-compatible API
+- **Search**: Hybrid scoring — 70% vector similarity + 30% full-text search rank
 - **Metadata**: GPT-4o-mini extracts structured metadata (type, tags, entities, action items) in parallel with embedding — best-effort, never blocks storage
+- **Duplicate detection**: Cosine similarity check before insert (default threshold 0.95, configurable via `DUPLICATE_THRESHOLD`)
 - **Indexing**: HNSW (not IVFFlat) — works on empty tables
 
 ## Tools
 
 | Tool | Description |
 |---|---|
-| `store_memory` | Save text with auto-generated embedding and AI-extracted metadata |
-| `search_memory` | Semantic similarity search — finds memories by meaning, not keywords |
+| `store_memory` | Save text with auto-generated embedding and AI-extracted metadata. Detects near-duplicates (configurable threshold) — pass `force: true` to skip. |
+| `store_memories` | Batch store up to 20 memories in one call. Each is processed concurrently with independent duplicate detection. |
+| `search_memory` | Hybrid semantic + full-text search. Optionally filter by `tags` (all must match) and/or `source`. |
 | `list_recent` | List the last N memories, optionally filtered by source |
 | `delete_memory` | Remove a memory by UUID |
+| `update_memory` | Update content, tags, or metadata on an existing memory. Re-embeds automatically if content changes. |
+| `find_related` | Find clusters of semantically similar memories — candidates for consolidation. Uses union-find clustering. |
 | `weekly_review` | Summarize the last N days: grouped by date, type/tag distribution, action items |
 | `memory_stats` | Aggregate dashboard: totals, sources, top tags, 30-day activity |
 
@@ -61,6 +66,17 @@ POSTGRES_DB=memory
 DATABASE_URL=postgresql://memory:<password>@mcp-memory-db:5432/memory
 OPENAI_API_KEY=sk-...
 MCP_API_KEY=<generate-with-openssl-rand-hex-32>
+
+# Optional — scoped API keys that force a source name:
+# MCP_API_KEY_KLAW=<token>        # All memories stored with this key get source="klaw"
+
+# Optional — embedding provider (defaults to OpenAI):
+# EMBEDDING_API_URL=https://api.openai.com/v1/embeddings
+# EMBEDDING_API_KEY=sk-...        # Defaults to OPENAI_API_KEY
+# EMBEDDING_MODEL=text-embedding-3-small
+
+# Optional — duplicate detection threshold (0.0–1.0, default 0.95):
+# DUPLICATE_THRESHOLD=0.95
 ```
 
 The `DATABASE_URL` must use the container name (`mcp-memory-db`), not the service name (`db`), to avoid DNS collisions if the server container is on a shared Docker network.
@@ -92,7 +108,7 @@ claude mcp add memory-server \
     -- https://your-domain.example.com/mcp
 ```
 
-Restart Claude Code. The six tools and two prompts will be available in every project.
+Restart Claude Code. The nine tools and two prompts will be available in every project.
 
 ## Webhook / Capture Form
 
@@ -127,9 +143,24 @@ Every `store_memory` call runs GPT-4o-mini in parallel with embedding generation
 
 AI metadata is stored under `metadata.ai` in the JSONB column, keeping it separate from user-supplied metadata. If extraction fails for any reason, the memory is still stored normally.
 
-## Authentication note
+## Authentication
 
 Authentication uses a Starlette `BaseHTTPMiddleware` that validates the Bearer token at the HTTP layer, before FastMCP processes the request. This works around a [known FastMCP bug](https://github.com/jlowin/fastmcp/issues/1233) where `get_http_headers()` returns stale or missing headers during tool execution with the Streamable HTTP transport. If FastMCP's own middleware sees your headers correctly in a future release, you could switch back — but the Starlette approach is arguably more correct anyway since auth belongs at the transport layer.
+
+### Scoped API keys
+
+You can create additional API keys that force a `source` value on all memories stored with that key. This is useful for external integrations where you want to identify the origin without trusting the caller to set it:
+
+```env
+MCP_API_KEY_KLAW=<token>    # Memories stored with this key always have source="klaw"
+MCP_API_KEY_BOT=<token>     # source="bot"
+```
+
+The suffix after `MCP_API_KEY_` becomes the forced source name (lowercased).
+
+## MCP client compatibility
+
+Some MCP clients (including Claude Code) double-serialise structured parameters — sending `'["a","b"]'` (a JSON string) instead of `["a","b"]` (a native array). The server handles this transparently using Pydantic `BeforeValidator` on all `list` and `dict` parameters, so tags and metadata work regardless of client behaviour.
 
 ## Docker networking note
 
