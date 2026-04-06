@@ -3,6 +3,9 @@ import json
 import asyncio
 import logging
 import contextvars
+import functools
+import inspect
+import types
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -181,6 +184,56 @@ async def extract_metadata(content: str) -> dict:
         return {}
 
 
+# ─── MCP Parameter Coercion ─────────────────────────────────────────────
+# Some MCP clients (including Claude Code) double-serialise structured
+# parameters, sending '["a","b"]' (a JSON string) instead of ["a","b"]
+# (a native array).  This decorator inspects type hints and parses any
+# str value that should be a list or dict back into native Python types.
+
+
+def _coerce_value(value, annotation):
+    """Parse a JSON-string value back to its intended type if needed."""
+    if not isinstance(value, str):
+        return value
+
+    # Handle Union types (e.g. list[str] | None)
+    if isinstance(annotation, types.UnionType):
+        for arg in annotation.__args__:
+            if arg is type(None):
+                continue
+            result = _coerce_value(value, arg)
+            if result is not value:
+                return result
+        return value
+
+    origin = getattr(annotation, "__origin__", None)
+    if annotation in (list, dict) or origin in (list, dict):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, (list, dict)):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return value
+
+
+def coerce_params(fn):
+    """Decorator: auto-parse JSON-stringified list/dict parameters."""
+    hints = {k: v for k, v in fn.__annotations__.items() if k != "return"}
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        for param_name, annotation in hints.items():
+            if param_name in kwargs:
+                kwargs[param_name] = _coerce_value(kwargs[param_name], annotation)
+        return await fn(*args, **kwargs)
+
+    # Preserve the original signature so FastMCP generates the correct schema
+    wrapper.__signature__ = inspect.signature(fn)
+    return wrapper
+
+
 # ─── JSON Encoder ────────────────────────────────────────────────────────
 
 
@@ -275,6 +328,7 @@ async def _store_memory_impl(
 
 
 @mcp.tool()
+@coerce_params
 async def store_memory(
     content: str,
     source: str = "manual",
@@ -300,6 +354,55 @@ async def store_memory(
 
 
 @mcp.tool()
+@coerce_params
+async def store_memories(
+    memories: list[dict],
+    force: bool = False,
+) -> str:
+    """
+    Store multiple memories in one call. Each memory is processed concurrently.
+
+    Args:
+        memories: List of memory objects, each with 'content' (required) and optional
+                  'source', 'tags', and 'metadata' fields.
+        force: Skip duplicate detection for all memories (default False).
+
+    Returns:
+        List of results (one per memory, in order).
+    """
+    if not memories or not isinstance(memories, list):
+        return json.dumps({"error": "memories must be a non-empty list"})
+    if len(memories) > 20:
+        return json.dumps({"error": "Maximum 20 memories per batch"})
+
+    async def _store_one(mem: dict) -> dict:
+        content = mem.get("content")
+        if not content or not isinstance(content, str):
+            return {"status": "error", "error": "Missing or invalid 'content'"}
+        try:
+            return await _store_memory_impl(
+                content=content,
+                source=mem.get("source", "manual"),
+                tags=mem.get("tags"),
+                metadata=mem.get("metadata"),
+                force=force,
+            )
+        except Exception as e:
+            return {"status": "error", "error": str(e), "content_preview": content[:100]}
+
+    results = await asyncio.gather(*[_store_one(m) for m in memories])
+    stored = sum(1 for r in results if r.get("status") == "stored")
+    dupes = sum(1 for r in results if r.get("status") == "duplicate_detected")
+    errors = sum(1 for r in results if r.get("status") == "error")
+
+    return json.dumps({
+        "summary": {"stored": stored, "duplicates": dupes, "errors": errors, "total": len(memories)},
+        "results": list(results),
+    }, cls=MemoryEncoder)
+
+
+@mcp.tool()
+@coerce_params
 async def search_memory(
     query: str,
     limit: int = 10,
@@ -445,6 +548,7 @@ async def delete_memory(memory_id: str) -> str:
 
 
 @mcp.tool()
+@coerce_params
 async def update_memory(
     memory_id: str,
     content: str | None = None,
@@ -670,6 +774,7 @@ async def memory_stats() -> str:
 
 
 @mcp.tool()
+@coerce_params
 async def find_related(
     threshold: float = 0.85,
     tags: list[str] | None = None,
