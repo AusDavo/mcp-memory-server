@@ -3,10 +3,8 @@ import json
 import asyncio
 import logging
 import contextvars
-import functools
-import inspect
-import types
 from datetime import datetime, timedelta, timezone
+from typing import Annotated
 from uuid import UUID
 
 import asyncpg
@@ -187,51 +185,37 @@ async def extract_metadata(content: str) -> dict:
 # ─── MCP Parameter Coercion ─────────────────────────────────────────────
 # Some MCP clients (including Claude Code) double-serialise structured
 # parameters, sending '["a","b"]' (a JSON string) instead of ["a","b"]
-# (a native array).  This decorator inspects type hints and parses any
-# str value that should be a list or dict back into native Python types.
+# (a native array).  Pydantic BeforeValidators intercept the raw value
+# before type-checking, so JSON strings are transparently parsed.
+
+from pydantic import BeforeValidator
 
 
-def _coerce_value(value, annotation):
-    """Parse a JSON-string value back to its intended type if needed."""
-    if not isinstance(value, str):
-        return value
-
-    # Handle Union types (e.g. list[str] | None)
-    if isinstance(annotation, types.UnionType):
-        for arg in annotation.__args__:
-            if arg is type(None):
-                continue
-            result = _coerce_value(value, arg)
-            if result is not value:
-                return result
-        return value
-
-    origin = getattr(annotation, "__origin__", None)
-    if annotation in (list, dict) or origin in (list, dict):
+def _coerce_json_list(v: object) -> object:
+    if isinstance(v, str):
         try:
-            parsed = json.loads(value)
-            if isinstance(parsed, (list, dict)):
+            parsed = json.loads(v)
+            if isinstance(parsed, list):
                 return parsed
         except (json.JSONDecodeError, TypeError):
             pass
+    return v
 
-    return value
+
+def _coerce_json_dict(v: object) -> object:
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return v
 
 
-def coerce_params(fn):
-    """Decorator: auto-parse JSON-stringified list/dict parameters."""
-    hints = {k: v for k, v in fn.__annotations__.items() if k != "return"}
-
-    @functools.wraps(fn)
-    async def wrapper(*args, **kwargs):
-        for param_name, annotation in hints.items():
-            if param_name in kwargs:
-                kwargs[param_name] = _coerce_value(kwargs[param_name], annotation)
-        return await fn(*args, **kwargs)
-
-    # Preserve the original signature so FastMCP generates the correct schema
-    wrapper.__signature__ = inspect.signature(fn)
-    return wrapper
+TagList = Annotated[list[str] | None, BeforeValidator(_coerce_json_list)]
+MetaDict = Annotated[dict | None, BeforeValidator(_coerce_json_dict)]
+MemoryList = Annotated[list[dict], BeforeValidator(_coerce_json_list)]
 
 
 # ─── JSON Encoder ────────────────────────────────────────────────────────
@@ -328,12 +312,11 @@ async def _store_memory_impl(
 
 
 @mcp.tool()
-@coerce_params
 async def store_memory(
     content: str,
     source: str = "manual",
-    tags: list[str] | None = None,
-    metadata: dict | None = None,
+    tags: TagList = None,
+    metadata: MetaDict = None,
     force: bool = False,
 ) -> str:
     """
@@ -354,9 +337,8 @@ async def store_memory(
 
 
 @mcp.tool()
-@coerce_params
 async def store_memories(
-    memories: list[dict],
+    memories: MemoryList,
     force: bool = False,
 ) -> str:
     """
@@ -402,11 +384,10 @@ async def store_memories(
 
 
 @mcp.tool()
-@coerce_params
 async def search_memory(
     query: str,
     limit: int = 10,
-    tags: list[str] | None = None,
+    tags: TagList = None,
     source: str | None = None,
 ) -> str:
     """
@@ -548,12 +529,11 @@ async def delete_memory(memory_id: str) -> str:
 
 
 @mcp.tool()
-@coerce_params
 async def update_memory(
     memory_id: str,
     content: str | None = None,
-    tags: list[str] | None = None,
-    metadata: dict | None = None,
+    tags: TagList = None,
+    metadata: MetaDict = None,
 ) -> str:
     """
     Update an existing memory. Re-embeds automatically if content changes.
@@ -774,10 +754,9 @@ async def memory_stats() -> str:
 
 
 @mcp.tool()
-@coerce_params
 async def find_related(
     threshold: float = 0.85,
-    tags: list[str] | None = None,
+    tags: TagList = None,
     limit: int = 50,
 ) -> str:
     """
