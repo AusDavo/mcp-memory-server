@@ -634,15 +634,23 @@ async def update_memory(
 
 
 @mcp.tool()
-async def weekly_review(days: int = 7) -> str:
+async def weekly_review(
+    days: int = 7,
+    include_memories: bool = False,
+    memory_limit: int = 50,
+) -> str:
     """
-    Review memories from the last N days, grouped by date with type/tag distribution and action items.
+    Review memories from the last N days: daily counts, type/tag distribution, and action items.
 
     Args:
         days: Number of days to look back (default 7).
+        include_memories: If True, include a per-memory list grouped by date (truncated).
+                          Default False — the digest alone is usually enough and keeps output small.
+        memory_limit: When include_memories=True, cap total memories returned (default 50,
+                      most recent first). Use list_recent for fuller pagination.
 
     Returns:
-        Structured summary for the LLM to synthesize themes and insights.
+        Compact digest for the LLM to synthesize themes and insights.
     """
     db = await get_pool()
     since = datetime.now(timezone.utc) - timedelta(days=days)
@@ -657,51 +665,61 @@ async def weekly_review(days: int = 7) -> str:
         since,
     )
 
-    # Group by date
-    by_date: dict[str, list] = {}
+    daily_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
     tag_counts: dict[str, int] = {}
     action_items: list[str] = []
 
     for row in rows:
         date_key = row["created_at"].strftime("%Y-%m-%d")
+        daily_counts[date_key] = daily_counts.get(date_key, 0) + 1
+
         meta = json.loads(row["metadata"]) if row["metadata"] else {}
         ai = meta.get("ai", {})
 
-        memory_summary = {
-            "id": str(row["id"]),
-            "content": row["content"][:200],
-            "source": row["source"],
-            "tags": row["tags"],
-            "type": ai.get("type", "unknown"),
-        }
-        by_date.setdefault(date_key, []).append(memory_summary)
-
-        # Count types
         mem_type = ai.get("type", "unknown")
         type_counts[mem_type] = type_counts.get(mem_type, 0) + 1
 
-        # Count tags
         for tag in row["tags"] or []:
             tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
-        # Collect action items
         for item in ai.get("action_items", []):
             action_items.append(f"[{date_key}] {item}")
 
-    return json.dumps(
-        {
-            "period": f"Last {days} days",
-            "total_memories": len(rows),
-            "by_date": by_date,
-            "type_distribution": type_counts,
-            "tag_distribution": dict(
-                sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
-            ),
-            "action_items": action_items,
-        },
-        cls=MemoryEncoder,
-    )
+    ACTION_ITEM_CAP = 50
+    action_items_truncated = len(action_items) > ACTION_ITEM_CAP
+
+    result: dict = {
+        "period": f"Last {days} days",
+        "total_memories": len(rows),
+        "daily_counts": dict(sorted(daily_counts.items(), reverse=True)),
+        "type_distribution": type_counts,
+        "tag_distribution": dict(
+            sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+        ),
+        "action_items": action_items[:ACTION_ITEM_CAP],
+        "action_items_truncated": action_items_truncated,
+        "action_items_total": len(action_items),
+    }
+
+    if include_memories:
+        by_date: dict[str, list] = {}
+        for row in rows[:memory_limit]:
+            date_key = row["created_at"].strftime("%Y-%m-%d")
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            ai = meta.get("ai", {})
+            by_date.setdefault(date_key, []).append({
+                "id": str(row["id"]),
+                "content": row["content"][:100],
+                "source": row["source"],
+                "tags": row["tags"],
+                "type": ai.get("type", "unknown"),
+            })
+        result["by_date"] = by_date
+        result["memories_returned"] = min(memory_limit, len(rows))
+        result["memories_truncated"] = len(rows) > memory_limit
+
+    return json.dumps(result, cls=MemoryEncoder)
 
 
 @mcp.tool()
