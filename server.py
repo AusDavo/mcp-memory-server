@@ -216,6 +216,7 @@ def _coerce_json_dict(v: object) -> object:
 TagList = Annotated[list[str] | None, BeforeValidator(_coerce_json_list)]
 MetaDict = Annotated[dict | None, BeforeValidator(_coerce_json_dict)]
 MemoryList = Annotated[list[dict], BeforeValidator(_coerce_json_list)]
+IntList = Annotated[list[int], BeforeValidator(_coerce_json_list)]
 
 
 # ─── JSON Encoder ────────────────────────────────────────────────────────
@@ -634,13 +635,136 @@ async def update_memory(
 
 
 @mcp.tool()
+async def resolve_action_items(memory_id: str, indices: IntList) -> str:
+    """
+    Mark action items on a memory as resolved (done / no longer open).
+
+    Resolution state is stored in metadata.ai.resolved_indices as a list of
+    integer indices into the memory's action_items array. Indices are 0-based.
+    Call at end of a session when you have completed work matching a prior TODO
+    surfaced by weekly_review.
+
+    Args:
+        memory_id: UUID of the memory whose action items to resolve.
+        indices: 0-based indices into metadata.ai.action_items to mark resolved.
+
+    Returns:
+        Updated open/resolved state for that memory, plus any invalid indices ignored.
+    """
+    db = await get_pool()
+    row = await db.fetchrow(
+        "SELECT id, metadata FROM memories WHERE id = $1",
+        memory_id,
+    )
+    if not row:
+        return json.dumps({"status": "not_found", "id": memory_id})
+
+    meta = json.loads(row["metadata"]) if row["metadata"] else {}
+    ai = meta.get("ai") or {}
+    action_items = ai.get("action_items") or []
+
+    if not action_items:
+        return json.dumps({
+            "status": "no_action_items",
+            "id": memory_id,
+        })
+
+    existing_resolved = set(ai.get("resolved_indices") or [])
+    valid_new = {i for i in indices if 0 <= i < len(action_items)}
+    invalid = sorted({i for i in indices if not (0 <= i < len(action_items))})
+    merged = sorted(existing_resolved | valid_new)
+
+    ai["resolved_indices"] = merged
+    meta["ai"] = ai
+
+    await db.execute(
+        "UPDATE memories SET metadata = $2::jsonb, updated_at = NOW() WHERE id = $1",
+        memory_id,
+        json.dumps(meta),
+    )
+
+    resolved_set = set(merged)
+    open_items = [
+        {"index": i, "text": t} for i, t in enumerate(action_items) if i not in resolved_set
+    ]
+    resolved_items = [
+        {"index": i, "text": action_items[i]} for i in merged
+    ]
+
+    return json.dumps({
+        "status": "updated",
+        "id": memory_id,
+        "open": open_items,
+        "resolved": resolved_items,
+        "invalid_indices": invalid,
+    })
+
+
+@mcp.tool()
+async def unresolve_action_items(memory_id: str, indices: IntList) -> str:
+    """
+    Reverse resolve_action_items — remove indices from metadata.ai.resolved_indices.
+
+    Args:
+        memory_id: UUID of the memory.
+        indices: 0-based indices to remove from the resolved list.
+
+    Returns:
+        Updated open/resolved state for that memory.
+    """
+    db = await get_pool()
+    row = await db.fetchrow(
+        "SELECT id, metadata FROM memories WHERE id = $1",
+        memory_id,
+    )
+    if not row:
+        return json.dumps({"status": "not_found", "id": memory_id})
+
+    meta = json.loads(row["metadata"]) if row["metadata"] else {}
+    ai = meta.get("ai") or {}
+    action_items = ai.get("action_items") or []
+
+    existing_resolved = set(ai.get("resolved_indices") or [])
+    merged = sorted(existing_resolved - set(indices))
+
+    ai["resolved_indices"] = merged
+    meta["ai"] = ai
+
+    await db.execute(
+        "UPDATE memories SET metadata = $2::jsonb, updated_at = NOW() WHERE id = $1",
+        memory_id,
+        json.dumps(meta),
+    )
+
+    resolved_set = set(merged)
+    open_items = [
+        {"index": i, "text": t} for i, t in enumerate(action_items) if i not in resolved_set
+    ]
+    resolved_items = [
+        {"index": i, "text": action_items[i]} for i in merged
+    ]
+
+    return json.dumps({
+        "status": "updated",
+        "id": memory_id,
+        "open": open_items,
+        "resolved": resolved_items,
+    })
+
+
+@mcp.tool()
 async def weekly_review(
     days: int = 7,
     include_memories: bool = False,
     memory_limit: int = 50,
+    include_resolved: bool = False,
 ) -> str:
     """
     Review memories from the last N days: daily counts, type/tag distribution, and action items.
+
+    Action items are returned as structured dicts ({memory_id, index, date, text})
+    so they can be passed directly to resolve_action_items. By default only
+    unresolved items are returned.
 
     Args:
         days: Number of days to look back (default 7).
@@ -648,6 +772,8 @@ async def weekly_review(
                           Default False — the digest alone is usually enough and keeps output small.
         memory_limit: When include_memories=True, cap total memories returned (default 50,
                       most recent first). Use list_recent for fuller pagination.
+        include_resolved: If True, also include already-resolved action items (flagged
+                          resolved: true). Default False.
 
     Returns:
         Compact digest for the LLM to synthesize themes and insights.
@@ -668,7 +794,8 @@ async def weekly_review(
     daily_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
     tag_counts: dict[str, int] = {}
-    action_items: list[str] = []
+    open_action_items: list[dict] = []
+    resolved_action_items: list[dict] = []
 
     for row in rows:
         date_key = row["created_at"].strftime("%Y-%m-%d")
@@ -683,11 +810,26 @@ async def weekly_review(
         for tag in row["tags"] or []:
             tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
-        for item in ai.get("action_items", []):
-            action_items.append(f"[{date_key}] {item}")
+        items = ai.get("action_items") or []
+        resolved_indices = set(ai.get("resolved_indices") or [])
+        mem_id = str(row["id"])
+        for idx, text in enumerate(items):
+            record = {
+                "memory_id": mem_id,
+                "index": idx,
+                "date": date_key,
+                "text": text,
+            }
+            if idx in resolved_indices:
+                record["resolved"] = True
+                resolved_action_items.append(record)
+            else:
+                open_action_items.append(record)
+
+    displayed = open_action_items + resolved_action_items if include_resolved else open_action_items
 
     ACTION_ITEM_CAP = 50
-    action_items_truncated = len(action_items) > ACTION_ITEM_CAP
+    action_items_truncated = len(displayed) > ACTION_ITEM_CAP
 
     result: dict = {
         "period": f"Last {days} days",
@@ -697,9 +839,11 @@ async def weekly_review(
         "tag_distribution": dict(
             sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:20]
         ),
-        "action_items": action_items[:ACTION_ITEM_CAP],
+        "action_items": displayed[:ACTION_ITEM_CAP],
         "action_items_truncated": action_items_truncated,
-        "action_items_total": len(action_items),
+        "action_items_total": len(displayed),
+        "open_action_items_count": len(open_action_items),
+        "resolved_action_items_count": len(resolved_action_items),
     }
 
     if include_memories:

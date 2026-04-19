@@ -33,7 +33,9 @@ Phone/browser ──HTTPS───────┘                  ▼
 | `delete_memory` | Remove a memory by UUID |
 | `update_memory` | Update content, tags, or metadata on an existing memory. Re-embeds automatically if content changes. |
 | `find_related` | Find clusters of semantically similar memories — candidates for consolidation. Uses union-find clustering. |
-| `weekly_review` | Summarize the last N days: grouped by date, type/tag distribution, action items |
+| `weekly_review` | Summarize the last N days: grouped by date, type/tag distribution, open action items. Pass `include_resolved=true` to also see resolved items. |
+| `resolve_action_items` | Mark action items on a memory as done (by 0-based index into `metadata.ai.action_items`). Persists to `metadata.ai.resolved_indices`. |
+| `unresolve_action_items` | Reverse a previous `resolve_action_items` call — remove indices from the resolved list. |
 | `memory_stats` | Aggregate dashboard: totals, sources, top tags, 30-day activity |
 
 ## Prompts
@@ -108,7 +110,7 @@ claude mcp add memory-server \
     -- https://your-domain.example.com/mcp
 ```
 
-Restart Claude Code. The nine tools and two prompts will be available in every project.
+Restart Claude Code. The eleven tools and two prompts will be available in every project.
 
 ## Webhook / Capture Form
 
