@@ -131,9 +131,19 @@ You can build a mobile-friendly web form that POSTs to this endpoint. If you use
 The included `backup.sh` script dumps the database with 14-day retention:
 
 ```bash
-# Add to cron (e.g. daily at 3am)
-0 3 * * * /path/to/mcp-memory-server/backup.sh
+# Add to cron (e.g. daily at 3am). Invoke via bash so a missing execute bit
+# on a fresh checkout can't silently break backups.
+0 3 * * * /bin/bash /path/to/mcp-memory-server/backup.sh >> /path/to/backups/cron.log 2>&1
 ```
+
+**Failure alerting (dead-man's switch).** Because the most common silent failure is "the cron never ran," `backup.sh` sends a success heartbeat to an [Uptime Kuma](https://github.com/louislam/uptime-kuma) **Push** monitor instead of only alerting from inside the script. Create a Push monitor (heartbeat interval slightly longer than your backup cadence, e.g. 25h), then drop its push URL into a gitignored `.backup-env` next to the script:
+
+```bash
+# .backup-env (gitignored — never committed)
+KUMA_PUSH_URL="https://<your-kuma>/api/push/<token>?status=up&msg=OK"
+```
+
+If the backup ever fails to run or complete, no heartbeat arrives and Kuma alerts via its own notification channels. If `.backup-env` is absent, no heartbeat is sent and backups still work.
 
 ## AI Metadata Extraction
 
