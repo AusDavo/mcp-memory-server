@@ -32,6 +32,12 @@ services:
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
       EMBEDDING_API_URL: ${EMBEDDING_API_URL:-https://api.openai.com/v1/embeddings}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     networks:
       - default
       - caddy_rev-proxy

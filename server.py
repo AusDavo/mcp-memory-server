@@ -73,7 +73,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         # Skip auth for health checks / OPTIONS preflight
-        if request.method == "OPTIONS":
+        if request.method == "OPTIONS" or request.url.path == "/health":
             return await call_next(request)
 
         auth_header = request.headers.get("authorization", "")
@@ -251,13 +251,10 @@ async def _store_memory_impl(
     tags = [t.lower().strip() for t in (tags or [])]
     metadata = metadata or {}
 
-    # Run embedding and AI metadata extraction in parallel
-    embedding, ai_metadata = await asyncio.gather(
-        get_embedding(content),
-        extract_metadata(content),
-    )
+    # Embed first — needed for the duplicate check below.
+    embedding = await get_embedding(content)
 
-    # Check for near-duplicate before inserting
+    # Check for near-duplicate before spending on metadata extraction or inserting.
     if not force:
         existing = await db.fetchrow(
             """
@@ -277,6 +274,9 @@ async def _store_memory_impl(
                 "existing_content_preview": existing["content"][:200],
                 "created_at": existing["created_at"].isoformat(),
             }
+
+    # Not a duplicate — only now pay for AI metadata extraction.
+    ai_metadata = await extract_metadata(content)
 
     # Merge AI-generated tags with user-supplied tags (deduplicated)
     ai_tags = [t.lower().strip() for t in ai_metadata.pop("topic_tags", [])]
@@ -1027,6 +1027,21 @@ async def find_related(
         },
         cls=MemoryEncoder,
     )
+
+
+# ─── Health Check ─────────────────────────────────────────────────────────
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Liveness + DB-connectivity probe. Exempt from auth (see middleware)."""
+    try:
+        db = await get_pool()
+        await db.fetchval("SELECT 1")
+        return JSONResponse({"status": "ok"})
+    except Exception as e:
+        logger.warning("Health check failed: %s", e)
+        return JSONResponse({"status": "unhealthy", "error": str(e)}, status_code=503)
 
 
 # ─── Webhook Endpoint ───────────────────────────────────────────────────
