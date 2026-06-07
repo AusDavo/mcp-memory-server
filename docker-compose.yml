@@ -27,7 +27,8 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       MCP_API_KEY: ${MCP_API_KEY}
-      MCP_API_KEY_KLAW: ${MCP_API_KEY_KLAW}
+      # Optional scoped keys (MCP_API_KEY_<NAME>) are defined per-deployment in
+      # docker-compose.override.yml, which is gitignored. Compose auto-merges it.
       DUPLICATE_THRESHOLD: ${DUPLICATE_THRESHOLD:-0.95}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
       EMBEDDING_API_URL: ${EMBEDDING_API_URL:-https://api.openai.com/v1/embeddings}

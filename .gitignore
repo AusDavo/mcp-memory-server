@@ -1,3 +1,4 @@
 .env
 __pycache__/
 backups/
+docker-compose.override.yml

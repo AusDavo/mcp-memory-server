@@ -69,8 +69,9 @@ DATABASE_URL=postgresql://memory:<password>@mcp-memory-db:5432/memory
 OPENAI_API_KEY=sk-...
 MCP_API_KEY=<generate-with-openssl-rand-hex-32>
 
-# Optional — scoped API keys that force a source name:
-# MCP_API_KEY_KLAW=<token>        # All memories stored with this key get source="klaw"
+# Optional — scoped API keys that force a source name. Define these in a
+# gitignored docker-compose.override.yml rather than here (see "Scoped API keys"):
+# MCP_API_KEY_<NAME>=<token>      # Memories stored with this key get source="<name>"
 
 # Optional — embedding provider (defaults to OpenAI):
 # EMBEDDING_API_URL=https://api.openai.com/v1/embeddings
@@ -136,7 +137,7 @@ The included `backup.sh` script dumps the database with 14-day retention:
 
 ## AI Metadata Extraction
 
-Every `store_memory` call runs GPT-4o-mini in parallel with embedding generation to extract:
+Each stored memory runs GPT-4o-mini to extract the following (skipped for memories rejected as near-duplicates, so duplicates cost nothing):
 
 - **Type**: `observation`, `task`, `idea`, `reference`, or `person_note`
 - **Topic tags**: 1–3 kebab-case tags, merged with any user-supplied tags
@@ -151,14 +152,19 @@ Authentication uses a Starlette `BaseHTTPMiddleware` that validates the Bearer t
 
 ### Scoped API keys
 
-You can create additional API keys that force a `source` value on all memories stored with that key. This is useful for external integrations where you want to identify the origin without trusting the caller to set it:
+You can create additional API keys that force a `source` value on all memories stored with that key. This is useful for external integrations where you want to identify the origin without trusting the caller to set it.
 
-```env
-MCP_API_KEY_KLAW=<token>    # Memories stored with this key always have source="klaw"
-MCP_API_KEY_BOT=<token>     # source="bot"
+Keep these keys out of version control: define them in a gitignored `docker-compose.override.yml`, which Compose merges automatically over the base file:
+
+```yaml
+# docker-compose.override.yml (gitignored — do not commit)
+services:
+  server:
+    environment:
+      MCP_API_KEY_<NAME>: ${MCP_API_KEY_<NAME>}   # forces source="<name>"
 ```
 
-The suffix after `MCP_API_KEY_` becomes the forced source name (lowercased).
+The suffix after `MCP_API_KEY_` becomes the forced source name (lowercased). The token values themselves live only in your untracked `.env`.
 
 ## MCP client compatibility
 

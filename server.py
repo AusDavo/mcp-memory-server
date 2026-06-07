@@ -33,7 +33,7 @@ logger = logging.getLogger("memory-server")
 #   MCP_API_KEY          → primary key, no source override (None)
 #   MCP_API_KEY_<NAME>   → scoped key, forces source to lowercase <NAME>
 #
-# Example: MCP_API_KEY_KLAW=abc123 means token "abc123" forces source="klaw"
+# Example: MCP_API_KEY_EXAMPLE=abc123 means token "abc123" forces source="example"
 
 TOKEN_SOURCE_MAP: dict[str, str | None] = {}
 
