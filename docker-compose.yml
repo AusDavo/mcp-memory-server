@@ -1,6 +1,10 @@
 services:
   db:
     image: pgvector/pgvector:pg17
+    labels:
+      # was being offered pg18-trixie — a major Postgres bump needing migration.
+      # Pinned to pg17; digest watching still reports rebuilds of that tag.
+      - wud.tag.include=^pg17$$
     container_name: mcp-memory-db
     restart: unless-stopped
     environment:
