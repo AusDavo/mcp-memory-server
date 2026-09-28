@@ -20,6 +20,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 DUPLICATE_THRESHOLD = float(os.environ.get("DUPLICATE_THRESHOLD", "0.95"))
+RRF_K = int(os.environ.get("RRF_K", "60"))
 
 # Embedding provider (defaults to OpenAI — any OpenAI-compatible API works)
 EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", OPENAI_API_KEY)
@@ -392,7 +393,8 @@ async def search_memory(
     source: str | None = None,
 ) -> str:
     """
-    Search memories by semantic similarity. Finds memories by meaning, not just keywords.
+    Hybrid search: semantic similarity fused with keyword matching. Finds memories
+    by meaning, and also by exact terms (identifiers, error codes, names).
 
     Args:
         query: Natural language search query. Describe what you're looking for.
@@ -401,15 +403,17 @@ async def search_memory(
         source: Optional source filter (e.g. 'claude-code').
 
     Returns:
-        List of matching memories ranked by relevance, with similarity scores.
+        List of matching memories ranked by fused relevance (score), with cosine
+        similarity and each list's rank (null if that list missed the memory).
     """
     db = await get_pool()
     limit = min(limit, 50)
     embedding = await get_embedding(query)
 
     conditions = []
-    params = [str(embedding), limit, query]
-    param_idx = 4
+    candidates = max(limit * 4, 40)
+    params = [str(embedding), limit, query, candidates]
+    param_idx = 5
 
     if tags:
         conditions.append(f"tags @> ${param_idx}::text[]")
@@ -425,21 +429,53 @@ async def search_memory(
     if conditions:
         where_clause = "WHERE " + " AND ".join(conditions)
 
+    # Hybrid search: independent vector and keyword candidate lists, fused
+    # with reciprocal rank fusion. The keyword query ORs the terms (plainto
+    # ANDs them, which matches nothing for natural-language queries) while
+    # keeping stemming and stop-word removal; ts_rank_cd still favours
+    # memories that match more of the terms. Memories matching all terms rank
+    # first; normalisation 1 stops long documents winning on sheer length.
+    keyword_where = "WHERE " + " AND ".join(
+        conditions + ["to_tsvector('english', content) @@ (SELECT q FROM kw_query)"]
+    )
     rows = await db.fetch(
         f"""
-        WITH candidates AS (
-            SELECT id, content, source, tags, metadata, created_at,
-                   1 - (embedding <=> $1::vector) AS vector_score,
-                   ts_rank_cd(to_tsvector('english', content), plainto_tsquery('english', $3)) AS fts_score
+        WITH kw_query AS (
+            SELECT replace(plainto_tsquery('english', $3)::text, '&', '|')::tsquery AS q,
+                   plainto_tsquery('english', $3) AS q_all
+        ),
+        vec AS (
+            SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> $1::vector) AS rank
             FROM memories
             {where_clause}
             ORDER BY embedding <=> $1::vector
-            LIMIT $2 * 3
+            LIMIT $4
+        ),
+        kw AS (
+            SELECT id, ts_rank_cd(to_tsvector('english', content), (SELECT q FROM kw_query), 1) AS fts_score,
+                   ROW_NUMBER() OVER (
+                       ORDER BY to_tsvector('english', content) @@ (SELECT q_all FROM kw_query) DESC,
+                                ts_rank_cd(to_tsvector('english', content), (SELECT q FROM kw_query), 1) DESC
+                   ) AS rank
+            FROM memories
+            {keyword_where}
+            ORDER BY rank
+            LIMIT $4
+        ),
+        fused AS (
+            SELECT COALESCE(vec.id, kw.id) AS id,
+                   vec.rank AS vector_rank,
+                   kw.rank AS keyword_rank,
+                   COALESCE(kw.fts_score, 0) AS fts_score,
+                   COALESCE(1.0 / ({RRF_K} + vec.rank), 0)
+                     + COALESCE(1.0 / ({RRF_K} + kw.rank), 0) AS score
+            FROM vec FULL OUTER JOIN kw ON vec.id = kw.id
         )
-        SELECT *,
-               vector_score * 0.7 + fts_score * 0.3 AS combined_score
-        FROM candidates
-        ORDER BY combined_score DESC
+        SELECT m.id, m.content, m.source, m.tags, m.metadata, m.created_at,
+               1 - (m.embedding <=> $1::vector) AS vector_score,
+               f.fts_score, f.vector_rank, f.keyword_rank, f.score
+        FROM fused f JOIN memories m ON m.id = f.id
+        ORDER BY f.score DESC, vector_score DESC
         LIMIT $2
         """,
         *params,
@@ -452,9 +488,11 @@ async def search_memory(
             "source": row["source"],
             "tags": row["tags"],
             "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-            "similarity": round(float(row["combined_score"]), 4),
-            "vector_score": round(float(row["vector_score"]), 4),
+            "score": round(float(row["score"]), 5),
+            "similarity": round(float(row["vector_score"]), 4),
             "fts_score": round(float(row["fts_score"]), 4),
+            "vector_rank": row["vector_rank"],
+            "keyword_rank": row["keyword_rank"],
             "created_at": row["created_at"].isoformat(),
         }
         for row in rows

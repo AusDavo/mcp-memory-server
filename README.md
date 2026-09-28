@@ -17,7 +17,7 @@ Phone/browser ──HTTPS───────┘                  ▼
 - **Database**: Postgres 17 with pgvector — stores text alongside 1536-dimension vector embeddings
 - **Server**: Python 3.13 + FastMCP — Streamable HTTP transport with Bearer token auth
 - **Embeddings**: OpenAI `text-embedding-3-small` by default, configurable to any OpenAI-compatible API
-- **Search**: Hybrid scoring — 70% vector similarity + 30% full-text search rank
+- **Search**: Hybrid — independent vector and keyword (OR-semantics full-text) candidate lists fused with reciprocal rank fusion (`RRF_K`, default 60)
 - **Metadata**: GPT-4o-mini extracts structured metadata (type, tags, entities, action items) in parallel with embedding — best-effort, never blocks storage
 - **Duplicate detection**: Cosine similarity check before insert (default threshold 0.95, configurable via `DUPLICATE_THRESHOLD`)
 - **Indexing**: HNSW (not IVFFlat) — works on empty tables
@@ -80,6 +80,9 @@ MCP_API_KEY=<generate-with-openssl-rand-hex-32>
 
 # Optional — duplicate detection threshold (0.0–1.0, default 0.95):
 # DUPLICATE_THRESHOLD=0.95
+
+# Optional — reciprocal rank fusion constant for hybrid search (default 60):
+# RRF_K=60
 ```
 
 The `DATABASE_URL` must use the container name (`mcp-memory-db`), not the service name (`db`), to avoid DNS collisions if the server container is on a shared Docker network.
