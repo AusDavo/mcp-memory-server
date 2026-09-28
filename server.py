@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import logging
@@ -234,6 +235,27 @@ class MemoryEncoder(json.JSONEncoder):
 
 # ─── Shared Storage Implementation ──────────────────────────────────────
 
+# A malformed client tool call can swallow the rest of its arguments into
+# `content` (e.g. "...text</content>\n<parameter name="source">claude-code").
+# The memory is then stored with default source/tags and markup in its text,
+# so reject it and let the client retry instead of storing it silently.
+TOOL_MARKUP = re.compile(r"</(?:content|invoke|parameter)>|<(?:parameter|invoke) name=")
+
+
+def _markup_error(content: str) -> dict | None:
+    m = TOOL_MARKUP.search(content)
+    if not m:
+        return None
+    return {
+        "status": "error",
+        "error": (
+            f"content contains tool-call markup ({m.group(0)!r} at offset {m.start()}): "
+            "the call was malformed and later arguments ended up inside content. "
+            "Retry with source/tags/metadata passed as separate arguments."
+        ),
+    }
+
+
 
 async def _store_memory_impl(
     content: str,
@@ -243,6 +265,9 @@ async def _store_memory_impl(
     force: bool = False,
 ) -> dict:
     """Core storage logic shared by the MCP tool and webhook endpoint."""
+    if err := _markup_error(content):
+        return err
+
     # Apply source override from scoped API key (if any)
     forced_source = auth_source_override.get()
     if forced_source is not None:
@@ -586,6 +611,9 @@ async def update_memory(
     Returns:
         Updated memory details, or not_found if the ID doesn't exist.
     """
+    if content is not None and (err := _markup_error(content)):
+        return json.dumps(err)
+
     db = await get_pool()
 
     existing = await db.fetchrow(
@@ -1108,7 +1136,7 @@ async def capture_webhook(request: Request) -> JSONResponse:
         tags=body.get("tags"),
         metadata=body.get("metadata"),
     )
-    return JSONResponse(result)
+    return JSONResponse(result, status_code=400 if result.get("status") == "error" else 200)
 
 
 # ─── Prompts ─────────────────────────────────────────────────────────────
