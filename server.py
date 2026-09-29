@@ -23,6 +23,8 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 # metadata extraction is skipped.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 RRF_K = int(os.environ.get("RRF_K", "60"))
+# Vector rank an all-terms keyword match needs in order to count (see search_memory).
+ALL_TERMS_GATE = 10
 
 # Similarity thresholds are model-specific: cosine scales differ between
 # embedders. Defaults suit text-embedding-3-small; nomic-embed-text runs
@@ -604,14 +606,23 @@ async def search_memory(
     #     verbatim, weighted 2x, since the English parser splits such tokens
     #     into fragments that match everywhere.
     #   all_terms — otherwise, or if no memory contains the identifiers:
-    #     memories matching every query term (stemmed, stop words dropped).
+    #     memories matching every query term (stemmed, stop words dropped)
+    #     that are also in the vector top 10, so it re-ranks, never adds.
     # Measured on 48 paraphrase + 53 identifier queries: paraphrase back to
     # vector-only quality, identifier R@10 0.65 -> 1.00.
     idents = _ident_tokens(query)
     ident_where = "WHERE " + " AND ".join(conditions + [f"content ILIKE ALL(${param_idx}::text[])"])
     params.append([_ilike_pattern(t) for t in idents])
+    # all_terms hits must also be in the vector top ALL_TERMS_GATE: long
+    # memories match every term by sheer size, and nomic ranks them near
+    # many queries, so an 8 KB memory at vector rank 26 took the top spot.
+    # Gate 10 measured best for both models (5 hurt OpenAI identifiers,
+    # 20 and 40 still let long memories through under nomic).
     keyword_where = "WHERE " + " AND ".join(
-        conditions + ["to_tsvector('english', content) @@ (SELECT q FROM kw_query)"]
+        conditions + [
+            "to_tsvector('english', content) @@ (SELECT q FROM kw_query)",
+            f"id IN (SELECT id FROM vec WHERE rank <= {ALL_TERMS_GATE})",
+        ]
     )
     rows = await db.fetch(
         f"""
