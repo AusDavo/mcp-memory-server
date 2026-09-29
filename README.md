@@ -2,7 +2,7 @@
 
 A self-hosted semantic memory layer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and other MCP clients. Store memories as text, search them by meaning, and capture thoughts from your phone — all on your own infrastructure.
 
-Built with [FastMCP](https://github.com/jlowin/fastmcp), Postgres + [pgvector](https://github.com/pgvector/pgvector), and OpenAI embeddings.
+Built with [FastMCP](https://github.com/jlowin/fastmcp), Postgres + [pgvector](https://github.com/pgvector/pgvector), and OpenAI or local (Ollama) embeddings.
 
 ## Architecture
 
@@ -14,12 +14,12 @@ Phone/browser ──HTTPS───────┘                  ▼
                                    (embeddings + metadata)
 ```
 
-- **Database**: Postgres 17 with pgvector — stores text alongside 1536-dimension vector embeddings
+- **Database**: Postgres 17 with pgvector — stores text alongside vector embeddings (1536 dims for OpenAI, 768 for nomic-embed-text) and the model that produced each one
 - **Server**: Python 3.13 + FastMCP — Streamable HTTP transport with Bearer token auth
-- **Embeddings**: OpenAI `text-embedding-3-small` by default, configurable to any OpenAI-compatible API
+- **Embeddings**: OpenAI `text-embedding-3-small` by default, configurable to any OpenAI-compatible API or to Ollama's native API (see [Local embeddings](#local-embeddings-ollama)). The server refuses to start if the configured model doesn't match the stored vectors
 - **Search**: Hybrid — independent vector and keyword (OR-semantics full-text) candidate lists fused with reciprocal rank fusion (`RRF_K`, default 60)
 - **Metadata**: GPT-4o-mini extracts structured metadata (type, tags, entities, action items) in parallel with embedding — best-effort, never blocks storage
-- **Duplicate detection**: Cosine similarity check before insert (default threshold 0.95, configurable via `DUPLICATE_THRESHOLD`)
+- **Duplicate detection**: Cosine similarity check before insert (default threshold 0.95, configurable via `DUPLICATE_THRESHOLD`; the right value depends on the embedding model)
 - **Indexing**: HNSW (not IVFFlat) — works on empty tables
 
 ## Tools
@@ -74,12 +74,16 @@ MCP_API_KEY=<generate-with-openssl-rand-hex-32>
 # MCP_API_KEY_<NAME>=<token>      # Memories stored with this key get source="<name>"
 
 # Optional — embedding provider (defaults to OpenAI):
+# EMBEDDING_PROVIDER=openai        # or "ollama" (native /api/embed)
 # EMBEDDING_API_URL=https://api.openai.com/v1/embeddings
-# EMBEDDING_API_KEY=sk-...        # Defaults to OPENAI_API_KEY
+# EMBEDDING_API_KEY=sk-...        # Defaults to OPENAI_API_KEY; never sent to Ollama
 # EMBEDDING_MODEL=text-embedding-3-small
+# EMBEDDING_DOC_PREFIX=           # task prefixes for asymmetric models (nomic, E5, BGE)
+# EMBEDDING_QUERY_PREFIX=
 
-# Optional — duplicate detection threshold (0.0–1.0, default 0.95):
-# DUPLICATE_THRESHOLD=0.95
+# Optional — similarity thresholds. These are model-specific (see Local embeddings):
+# DUPLICATE_THRESHOLD=0.95         # store rejects a near-duplicate at or above this
+# FIND_RELATED_THRESHOLD=0.85      # find_related default
 
 # Optional — reciprocal rank fusion constant for hybrid search (default 60):
 # RRF_K=60
@@ -147,6 +151,40 @@ KUMA_PUSH_URL="https://<your-kuma>/api/push/<token>?status=up&msg=OK"
 ```
 
 If the backup ever fails to run or complete, no heartbeat arrives and Kuma alerts via its own notification channels. If `.backup-env` is absent, no heartbeat is sent and backups still work.
+
+## Local embeddings (Ollama)
+
+Embeddings can run on your own hardware with [Ollama](https://ollama.com), so memory text never leaves your network for embedding. (AI metadata extraction still calls OpenAI while `OPENAI_API_KEY` is set; leave it unset to skip that too.)
+
+Settings for `nomic-embed-text` (768 dims), with its task prefixes and thresholds calibrated on a real store of about 1,700 memories:
+
+```env
+EMBEDDING_PROVIDER=ollama
+EMBEDDING_API_URL=http://ollama:11434/api/embed   # the default for ollama
+EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_DOC_PREFIX="search_document: "
+EMBEDDING_QUERY_PREFIX="search_query: "
+EMBEDDING_NUM_THREAD=2          # match to your CPU; omit to let Ollama choose
+EMBEDDING_MAX_TOKENS=2048       # nomic's context; longer inputs are truncated
+DUPLICATE_THRESHOLD=0.975
+FIND_RELATED_THRESHOLD=0.90
+```
+
+Why these thresholds: nomic's cosine scale runs higher than OpenAI's (unrelated memories score about 0.63, against 0.34). Light edits of a memory (typo, added line, dropped sentence) all scored at least 0.981, while distinct memories about closely related facts reached 0.962. 0.975 sits between the two.
+
+Memories longer than the model's context are embedded from their start only, and are flagged `metadata.embedding.truncated`. Keyword search still indexes their full text.
+
+The Ollama container must share a Docker network with the server. Pin the model: re-pulling a tag can change its weights, and with them every vector.
+
+### Switching an existing store to another model
+
+Vectors from different models can't be compared, so switching means re-embedding every memory. `migrations/` has the steps for OpenAI → nomic:
+
+1. `001-embedding-model.sql` adds the `embedding_model` column. Run it before deploying a server version that writes it.
+2. `002-nomic-768.sql` phase A adds staging columns while the server keeps running. `backfill_embeddings.py` fills them; it can reuse vectors from an earlier run where the content is unchanged.
+3. Stop the server, rerun the backfill to catch late writes, then run phase B. It swaps the columns in one transaction and aborts, changing nothing, if any row lacks a current vector. Set the Ollama env above and start the server.
+
+The old vectors stay in `embedding_openai`. To roll back: stop the server, rename the columns back, re-embed any memories created since the switch with the old model, and restore the old env. Once you're sure, drop the column: `ALTER TABLE memories DROP COLUMN embedding_openai; VACUUM FULL memories;`
 
 ## AI Metadata Extraction
 

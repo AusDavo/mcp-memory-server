@@ -19,14 +19,39 @@ from starlette.middleware.base import BaseHTTPMiddleware
 # ─── Configuration ───────────────────────────────────────────────────────
 
 DATABASE_URL = os.environ["DATABASE_URL"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-DUPLICATE_THRESHOLD = float(os.environ.get("DUPLICATE_THRESHOLD", "0.95"))
+# Only needed for OpenAI embeddings and AI metadata extraction. Without it,
+# metadata extraction is skipped.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 RRF_K = int(os.environ.get("RRF_K", "60"))
 
-# Embedding provider (defaults to OpenAI — any OpenAI-compatible API works)
+# Similarity thresholds are model-specific: cosine scales differ between
+# embedders. Defaults suit text-embedding-3-small; nomic-embed-text runs
+# higher (duplicate 0.975, related 0.90 — calibrated 2026-09-29).
+DUPLICATE_THRESHOLD = float(os.environ.get("DUPLICATE_THRESHOLD", "0.95"))
+FIND_RELATED_THRESHOLD = float(os.environ.get("FIND_RELATED_THRESHOLD", "0.85"))
+
+# Embedding provider:
+#   openai — any OpenAI-compatible /v1/embeddings API (default)
+#   ollama — Ollama's native /api/embed, which accepts num_thread and reports
+#            token counts, so truncated inputs can be flagged
+EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "openai").lower()
 EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", OPENAI_API_KEY)
-EMBEDDING_API_URL = os.environ.get("EMBEDDING_API_URL", "https://api.openai.com/v1/embeddings")
+# Empty (as compose passes when unset) means the provider's default.
+EMBEDDING_API_URL = os.environ.get("EMBEDDING_API_URL") or (
+    "http://ollama:11434/api/embed" if EMBEDDING_PROVIDER == "ollama"
+    else "https://api.openai.com/v1/embeddings"
+)
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+# Asymmetric models (nomic, E5, BGE) expect task prefixes, e.g. nomic's
+# "search_document: " / "search_query: ". Results degrade quietly without them.
+EMBEDDING_DOC_PREFIX = os.environ.get("EMBEDDING_DOC_PREFIX", "")
+EMBEDDING_QUERY_PREFIX = os.environ.get("EMBEDDING_QUERY_PREFIX", "")
+# Ollama only: CPU threads per request, and the model's context in tokens
+# (inputs reaching it were truncated).
+EMBEDDING_NUM_THREAD = int(os.environ.get("EMBEDDING_NUM_THREAD", "0"))
+EMBEDDING_MAX_TOKENS = int(os.environ.get("EMBEDDING_MAX_TOKENS", "2048"))
+# Generous: Ollama serves one request at a time, so a 20-memory batch queues.
+EMBEDDING_TIMEOUT = float(os.environ.get("EMBEDDING_TIMEOUT", "120"))
 
 logger = logging.getLogger("memory-server")
 
@@ -129,17 +154,99 @@ def get_http_client() -> httpx.AsyncClient:
 # ─── Embedding Helper ───────────────────────────────────────────────────
 
 
-async def get_embedding(text: str) -> list[float]:
-    """Generate embedding via the configured provider (OpenAI-compatible API)."""
+async def get_embedding(text: str, kind: str = "doc") -> tuple[list[float], bool]:
+    """Embed text via the configured provider.
+
+    kind is "doc" for stored content and "query" for searches; it selects the
+    task prefix. Returns (vector, truncated). truncated is only ever True for
+    Ollama, which reports how many tokens it consumed.
+    """
+    prefix = EMBEDDING_QUERY_PREFIX if kind == "query" else EMBEDDING_DOC_PREFIX
     client = get_http_client()
+
+    if EMBEDDING_PROVIDER == "ollama":
+        # No auth header: Ollama has none, and EMBEDDING_API_KEY defaults to
+        # the OpenAI key, which shouldn't be sent anywhere else.
+        body = {"model": EMBEDDING_MODEL, "input": prefix + text, "truncate": True}
+        if EMBEDDING_NUM_THREAD:
+            body["options"] = {"num_thread": EMBEDDING_NUM_THREAD}
+        response = await client.post(EMBEDDING_API_URL, json=body, timeout=EMBEDDING_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        return data["embeddings"][0], data.get("prompt_eval_count", 0) >= EMBEDDING_MAX_TOKENS
+
     response = await client.post(
         EMBEDDING_API_URL,
         headers={"Authorization": f"Bearer {EMBEDDING_API_KEY}"},
-        json={"model": EMBEDDING_MODEL, "input": text},
+        json={"model": EMBEDDING_MODEL, "input": prefix + text},
+        timeout=EMBEDDING_TIMEOUT,
     )
     response.raise_for_status()
     data = response.json()
-    return data["data"][0]["embedding"]
+    return data["data"][0]["embedding"], False
+
+
+def _embedding_meta(meta: dict, truncated: bool) -> dict:
+    """Record (or clear) the truncation flag in a memory's metadata."""
+    if truncated:
+        meta["embedding"] = {"truncated": True, "max_tokens": EMBEDDING_MAX_TOKENS}
+    else:
+        meta.pop("embedding", None)
+    return meta
+
+
+async def check_embedding_config() -> None:
+    """Refuse to start if the configured embedder doesn't match the stored vectors.
+
+    Vectors from different models are incompatible, and a mismatch fails
+    silently: searches still return results, just meaningless ones. Two checks:
+    the probe vector's length must equal the column's vector(N), and no row
+    may carry a different embedding_model. If the embedder is unreachable the
+    check is skipped (logged) so the server can still serve reads.
+    """
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        dims = await conn.fetchval(
+            "SELECT atttypmod FROM pg_attribute "
+            "WHERE attrelid = 'memories'::regclass AND attname = 'embedding'"
+        )
+        try:
+            others = await conn.fetch(
+                "SELECT embedding_model, COUNT(*) AS n FROM memories "
+                "WHERE embedding_model IS DISTINCT FROM $1 GROUP BY embedding_model",
+                EMBEDDING_MODEL,
+            )
+        except asyncpg.UndefinedColumnError:
+            raise SystemExit(
+                "memories.embedding_model is missing: run migrations/001-embedding-model.sql"
+            )
+    finally:
+        await conn.close()
+
+    if others:
+        found = ", ".join(f"{r['embedding_model'] or 'unrecorded'} ({r['n']})" for r in others)
+        raise SystemExit(
+            f"EMBEDDING_MODEL is {EMBEDDING_MODEL!r} but stored rows were embedded "
+            f"by: {found}. Re-embed them (see migrations/) or fix the config."
+        )
+
+    try:
+        probe, _ = await get_embedding("dimension probe")
+    except Exception as e:
+        logger.warning("Embedding check skipped, embedder unreachable: %s", e)
+        return
+    finally:
+        # The HTTP client is bound to this event loop; drop it.
+        global _http_client
+        if _http_client is not None:
+            await _http_client.aclose()
+            _http_client = None
+    if len(probe) != dims:
+        raise SystemExit(
+            f"{EMBEDDING_MODEL} returns {len(probe)} dimensions but the "
+            f"embedding column is vector({dims})."
+        )
+    logger.info("Embedding config OK: %s, %d dims", EMBEDDING_MODEL, dims)
 
 
 # ─── AI Metadata Extraction ─────────────────────────────────────────────
@@ -149,7 +256,10 @@ async def extract_metadata(content: str) -> dict:
     """Call GPT-4o-mini to extract structured metadata from content.
 
     Best-effort: returns {} on any failure. Never blocks storage.
+    Skipped entirely when no OpenAI key is configured.
     """
+    if not OPENAI_API_KEY:
+        return {}
     try:
         client = get_http_client()
         response = await client.post(
@@ -278,7 +388,7 @@ async def _store_memory_impl(
     metadata = metadata or {}
 
     # Embed first — needed for the duplicate check below.
-    embedding = await get_embedding(content)
+    embedding, truncated = await get_embedding(content, "doc")
 
     # Check for near-duplicate before spending on metadata extraction or inserting.
     if not force:
@@ -311,15 +421,17 @@ async def _store_memory_impl(
     # Store AI metadata under 'ai' key (never conflicts with user keys)
     if ai_metadata:
         metadata["ai"] = ai_metadata
+    _embedding_meta(metadata, truncated)
 
     row = await db.fetchrow(
         """
-        INSERT INTO memories (content, embedding, source, tags, metadata)
-        VALUES ($1, $2::vector, $3, $4, $5::jsonb)
+        INSERT INTO memories (content, embedding, embedding_model, source, tags, metadata)
+        VALUES ($1, $2::vector, $3, $4, $5, $6::jsonb)
         RETURNING id, created_at
         """,
         content,
         str(embedding),
+        EMBEDDING_MODEL,
         source,
         merged_tags,
         json.dumps(metadata),
@@ -433,7 +545,7 @@ async def search_memory(
     """
     db = await get_pool()
     limit = min(limit, 50)
-    embedding = await get_embedding(query)
+    embedding, _ = await get_embedding(query, "query")
 
     conditions = []
     candidates = max(limit * 4, 40)
@@ -628,8 +740,8 @@ async def update_memory(
     idx = 2
 
     if content is not None and content != existing["content"]:
-        embedding, ai_metadata = await asyncio.gather(
-            get_embedding(content),
+        (embedding, truncated), ai_metadata = await asyncio.gather(
+            get_embedding(content, "doc"),
             extract_metadata(content),
         )
         ai_tags = [t.lower().strip() for t in ai_metadata.pop("topic_tags", [])]
@@ -650,6 +762,9 @@ async def update_memory(
         set_clauses.append(f"embedding = ${idx}::vector")
         params.append(str(embedding))
         idx += 1
+        set_clauses.append(f"embedding_model = ${idx}")
+        params.append(EMBEDDING_MODEL)
+        idx += 1
         set_clauses.append(f"tags = ${idx}")
         params.append(new_tags)
         idx += 1
@@ -660,6 +775,7 @@ async def update_memory(
             existing_meta.update(metadata)
         if ai_metadata:
             existing_meta["ai"] = ai_metadata
+        _embedding_meta(existing_meta, truncated)
         set_clauses.append(f"metadata = ${idx}::jsonb")
         params.append(json.dumps(existing_meta))
         idx += 1
@@ -983,7 +1099,7 @@ async def memory_stats() -> str:
 
 @mcp.tool()
 async def find_related(
-    threshold: float = 0.85,
+    threshold: float | None = None,
     tags: TagList = None,
     limit: int = 50,
 ) -> str:
@@ -991,7 +1107,9 @@ async def find_related(
     Find clusters of related memories that may be candidates for consolidation.
 
     Args:
-        threshold: Minimum cosine similarity to consider related (default 0.85, range 0.7-0.95).
+        threshold: Minimum cosine similarity to consider related (range 0.7-0.99).
+                   Defaults to the server's FIND_RELATED_THRESHOLD, which is
+                   tuned per embedding model; omit it unless you need to widen or narrow.
         tags: Optional tag filter — only consider memories with ALL of these tags.
         limit: Maximum number of pairs to analyze (default 50).
 
@@ -1000,7 +1118,9 @@ async def find_related(
         Use update_memory to merge and delete_memory to remove redundant entries.
     """
     db = await get_pool()
-    threshold = max(0.7, min(0.95, threshold))
+    if threshold is None:
+        threshold = FIND_RELATED_THRESHOLD
+    threshold = max(0.7, min(0.99, threshold))
     limit = min(limit, 200)
 
     conditions = ["m1.id < m2.id"]
@@ -1100,14 +1220,29 @@ async def find_related(
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
-    """Liveness + DB-connectivity probe. Exempt from auth (see middleware)."""
+    """Liveness + DB-connectivity probe. Exempt from auth (see middleware).
+
+    Also reports whether a local (Ollama) embedder is reachable. That is
+    informational only: a down embedder breaks stores and searches but not
+    reads, and failing the probe would restart-loop the container for nothing.
+    """
     try:
         db = await get_pool()
         await db.fetchval("SELECT 1")
-        return JSONResponse({"status": "ok"})
     except Exception as e:
         logger.warning("Health check failed: %s", e)
         return JSONResponse({"status": "unhealthy", "error": str(e)}, status_code=503)
+
+    body = {"status": "ok", "embedding_model": EMBEDDING_MODEL}
+    if EMBEDDING_PROVIDER == "ollama":
+        # Ollama's root answers "Ollama is running"; no model load, no CPU cost.
+        base = EMBEDDING_API_URL.split("/api/")[0]
+        try:
+            r = await get_http_client().get(base, timeout=3.0)
+            body["embedder"] = "ok" if r.status_code == 200 else f"http {r.status_code}"
+        except Exception as e:
+            body["embedder"] = f"unreachable: {type(e).__name__}"
+    return JSONResponse(body)
 
 
 # ─── Webhook Endpoint ───────────────────────────────────────────────────
@@ -1185,6 +1320,7 @@ def quick_capture(text: str, context: str = "") -> str:
 # ─── Entry Point ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    asyncio.run(check_embedding_config())
     mcp.run(
         transport="http",
         host="0.0.0.0",
