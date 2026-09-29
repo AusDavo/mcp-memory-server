@@ -18,7 +18,7 @@ Phone/browser ──HTTPS───────┘                  ▼
 - **Server**: Python 3.13 + FastMCP — Streamable HTTP transport with Bearer token auth
 - **Embeddings**: OpenAI `text-embedding-3-small` by default, configurable to any OpenAI-compatible API or to Ollama's native API (see [Local embeddings](#local-embeddings-ollama)). The server refuses to start if the configured model doesn't match the stored vectors
 - **Search**: Hybrid — a vector candidate list fused by reciprocal rank fusion (`RRF_K`, default 60) with a keyword list that admits only strong matches: memories containing the query's identifier-like tokens verbatim (hostnames, config keys, hashes, error codes; weighted 2×), otherwise memories matching every query term, provided they are also in the vector top 10 (so long memories can't get in on word count alone). Each result's `keyword_mode` says which applied
-- **Metadata**: GPT-4o-mini extracts structured metadata (type, tags, entities, action items) in parallel with embedding — best-effort, never blocks storage
+- **Metadata**: the calling client can pass a memory's `action_items` and `memory_type`. Otherwise, if `OPENAI_API_KEY` is set, GPT-4o-mini extracts them (plus tags and entities); it's best-effort and never blocks storage
 - **Duplicate detection**: Cosine similarity check before insert (default threshold 0.95, configurable via `DUPLICATE_THRESHOLD`; the right value depends on the embedding model)
 - **Indexing**: HNSW (not IVFFlat) — works on empty tables
 
@@ -26,12 +26,12 @@ Phone/browser ──HTTPS───────┘                  ▼
 
 | Tool | Description |
 |---|---|
-| `store_memory` | Save text with auto-generated embedding and AI-extracted metadata. Detects near-duplicates (configurable threshold) — pass `force: true` to skip. |
+| `store_memory` | Save text with auto-generated embedding, plus optional `action_items` / `memory_type` (or AI-extracted metadata when no client metadata is given and OpenAI is configured). Detects near-duplicates (configurable threshold) — pass `force: true` to skip. |
 | `store_memories` | Batch store up to 20 memories in one call. Each is processed concurrently with independent duplicate detection. |
 | `search_memory` | Hybrid semantic + full-text search. Optionally filter by `tags` (all must match) and/or `source`. |
 | `list_recent` | List the last N memories, optionally filtered by source |
 | `delete_memory` | Remove a memory by UUID |
-| `update_memory` | Update content, tags, or metadata on an existing memory. Re-embeds automatically if content changes. |
+| `update_memory` | Update content, tags, metadata, `action_items` or `memory_type` on an existing memory. Re-embeds automatically if content changes. |
 | `find_related` | Find clusters of semantically similar memories — candidates for consolidation. Uses union-find clustering. |
 | `weekly_review` | Summarize the last N days: grouped by date, type/tag distribution, open action items. Pass `include_resolved=true` to also see resolved items. |
 | `resolve_action_items` | Mark action items on a memory as done (by 0-based index into `metadata.ai.action_items`). Persists to `metadata.ai.resolved_indices`. |
@@ -50,7 +50,7 @@ Phone/browser ──HTTPS───────┘                  ▼
 ### Prerequisites
 
 - Docker and Docker Compose
-- An OpenAI API key (for embeddings and metadata extraction)
+- An OpenAI API key, unless you use local embeddings (Ollama) and client-supplied metadata
 - A reverse proxy that handles TLS (e.g. Caddy, Nginx, Traefik)
 
 ### 1. Configure environment
@@ -154,7 +154,7 @@ If the backup ever fails to run or complete, no heartbeat arrives and Kuma alert
 
 ## Local embeddings (Ollama)
 
-Embeddings can run on your own hardware with [Ollama](https://ollama.com), so memory text never leaves your network for embedding. (AI metadata extraction still calls OpenAI while `OPENAI_API_KEY` is set; leave it unset to skip that too.)
+Embeddings can run on your own hardware with [Ollama](https://ollama.com), so memory text never leaves your network for embedding. (Leave `OPENAI_API_KEY` unset as well and nothing goes to OpenAI: clients supply action items themselves, see [Metadata](#metadata).)
 
 Settings for `nomic-embed-text` (768 dims), with its task prefixes and thresholds calibrated on a real store of about 1,700 memories:
 
@@ -186,16 +186,15 @@ Vectors from different models can't be compared, so switching means re-embedding
 
 The old vectors stay in `embedding_openai`. To roll back: stop the server, rename the columns back, re-embed any memories created since the switch with the old model, and restore the old env. Once you're sure, drop the column: `ALTER TABLE memories DROP COLUMN embedding_openai; VACUUM FULL memories;`
 
-## AI Metadata Extraction
+## Metadata
 
-Each stored memory runs GPT-4o-mini to extract the following (skipped for memories rejected as near-duplicates, so duplicates cost nothing):
+Metadata lives under `metadata.ai`, separate from user-supplied metadata. `resolve_action_items`, `unresolve_action_items` and `weekly_review` read it.
 
-- **Type**: `observation`, `task`, `idea`, `reference`, or `person_note`
-- **Topic tags**: 1–3 kebab-case tags, merged with any user-supplied tags
-- **Entities**: people, places, organizations mentioned
-- **Action items**: anything actionable
+**Client-supplied (recommended).** The calling model passes `action_items` (concrete follow-ups the user still has to do; most memories have none) and optionally `memory_type` (`observation`, `task`, `decision`, `idea`, `reference`, `person_note`, `meeting`) to `store_memory`, `store_memories` or `update_memory`. The convention reaches clients through the tool descriptions and server instructions, so no per-client setup is needed. These are stored with `extracted_by: "client"`. The caller has the conversation's context, so it can tell a real to-do from a plan it's only describing, and the text goes to no one new.
 
-AI metadata is stored under `metadata.ai` in the JSONB column, keeping it separate from user-supplied metadata. If extraction fails for any reason, the memory is still stored normally.
+**Server-side extraction (fallback).** If the client passes neither field and `OPENAI_API_KEY` is set, GPT-4o-mini extracts the type, 1–3 topic tags (merged into `tags`), entities and action items. It's skipped for near-duplicates and never blocks storage. Leave `OPENAI_API_KEY` unset to turn it off.
+
+Replacing a memory's `action_items` through `update_memory` resets which of them are resolved.
 
 ## Authentication
 

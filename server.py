@@ -127,7 +127,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 mcp = FastMCP(
     "Memory Server",
-    instructions="Personal semantic memory layer. Store and search memories across all your AI tools.",
+    instructions=(
+        "Personal semantic memory layer. Store and search memories across all your AI tools. "
+        "When storing, pass action_items only for concrete follow-ups the user still has to do "
+        "(most memories have none), and memory_type when it's clear."
+    ),
 )
 
 # ─── Database Pool ───────────────────────────────────────────────────────
@@ -369,16 +373,61 @@ def _markup_error(content: str) -> dict | None:
 
 
 
+MEMORY_TYPES = ("observation", "task", "decision", "idea", "reference", "person_note", "meeting")
+MAX_ACTION_ITEMS, MAX_ACTION_ITEM_CHARS = 10, 300
+
+
+def _client_ai_metadata(action_items: list | None, memory_type: str | None) -> dict | None:
+    """Validate metadata supplied by the calling client.
+
+    Returns None when the client supplied nothing, a {"status": "error"} dict
+    on bad input, else the metadata.ai fields to store. Stored under the same
+    keys the server-side extractor used, so resolve_action_items and
+    weekly_review read both alike.
+    """
+    if action_items is None and memory_type is None:
+        return None
+    ai: dict = {"extracted_by": "client"}
+    if memory_type is not None:
+        memory_type = memory_type.strip().lower()
+        if memory_type not in MEMORY_TYPES:
+            return {"status": "error", "error": f"memory_type must be one of: {', '.join(MEMORY_TYPES)}"}
+        ai["type"] = memory_type
+    if action_items is not None:
+        if not isinstance(action_items, list) or not all(isinstance(a, str) for a in action_items):
+            return {"status": "error", "error": "action_items must be a list of strings"}
+        items = [a.strip() for a in action_items if a.strip()]
+        if len(items) > MAX_ACTION_ITEMS or any(len(a) > MAX_ACTION_ITEM_CHARS for a in items):
+            return {"status": "error", "error": f"at most {MAX_ACTION_ITEMS} action_items of {MAX_ACTION_ITEM_CHARS} chars each"}
+        ai["action_items"] = items
+    return ai
+
+
+def _apply_client_ai(meta: dict, client_ai: dict) -> None:
+    """Merge client-supplied fields into meta["ai"] in place. New action items
+    invalidate the old resolved indices, which pointed into the old list."""
+    ai = meta.get("ai") or {}
+    if "action_items" in client_ai and client_ai["action_items"] != ai.get("action_items"):
+        ai.pop("resolved_indices", None)
+    ai.update(client_ai)
+    meta["ai"] = ai
+
+
 async def _store_memory_impl(
     content: str,
     source: str = "manual",
     tags: list[str] | None = None,
     metadata: dict | None = None,
     force: bool = False,
+    action_items: list | None = None,
+    memory_type: str | None = None,
 ) -> dict:
     """Core storage logic shared by the MCP tool and webhook endpoint."""
     if err := _markup_error(content):
         return err
+    client_ai = _client_ai_metadata(action_items, memory_type)
+    if client_ai and client_ai.get("status") == "error":
+        return client_ai
 
     # Apply source override from scoped API key (if any)
     forced_source = auth_source_override.get()
@@ -413,8 +462,9 @@ async def _store_memory_impl(
                 "created_at": existing["created_at"].isoformat(),
             }
 
-    # Not a duplicate — only now pay for AI metadata extraction.
-    ai_metadata = await extract_metadata(content)
+    # Not a duplicate. Metadata the client supplied wins; otherwise fall back
+    # to server-side extraction, which is skipped without an OpenAI key.
+    ai_metadata = client_ai if client_ai is not None else await extract_metadata(content)
 
     # Merge AI-generated tags with user-supplied tags (deduplicated)
     ai_tags = [t.lower().strip() for t in ai_metadata.pop("topic_tags", [])]
@@ -485,6 +535,8 @@ async def store_memory(
     tags: TagList = None,
     metadata: MetaDict = None,
     force: bool = False,
+    action_items: TagList = None,
+    memory_type: str | None = None,
 ) -> str:
     """
     Store a new memory with automatic semantic embedding.
@@ -495,11 +547,21 @@ async def store_memory(
         tags: Optional list of tags for categorical filtering (e.g. ['project-x', 'decision']).
         metadata: Optional JSON metadata (e.g. {'project': 'website-redesign', 'priority': 'high'}).
         force: Skip duplicate detection and store regardless (default False).
+        action_items: Concrete follow-ups the user still has to do, each a short
+            imperative (e.g. ['Rotate the MCP API key']). Most memories have none:
+            leave this out for observations, decisions, references, completed
+            work, and plans you are only describing. These feed
+            resolve_action_items and weekly_review. Up to 10.
+        memory_type: One of observation, task, decision, idea, reference,
+            person_note, meeting. Optional.
 
     Returns:
         Confirmation with the memory ID.
     """
-    result = await _store_memory_impl(content, source, tags, metadata, force=force)
+    result = await _store_memory_impl(
+        content, source, tags, metadata, force=force,
+        action_items=action_items, memory_type=memory_type,
+    )
     return json.dumps(result)
 
 
@@ -513,7 +575,8 @@ async def store_memories(
 
     Args:
         memories: List of memory objects, each with 'content' (required) and optional
-                  'source', 'tags', and 'metadata' fields.
+                  'source', 'tags', 'metadata', 'action_items' and 'memory_type'
+                  fields (same meaning as in store_memory).
         force: Skip duplicate detection for all memories (default False).
 
     Returns:
@@ -535,6 +598,8 @@ async def store_memories(
                 tags=mem.get("tags"),
                 metadata=mem.get("metadata"),
                 force=force,
+                action_items=_coerce_json_list(mem.get("action_items")),
+                memory_type=mem.get("memory_type"),
             )
         except Exception as e:
             return {"status": "error", "error": str(e), "content_preview": content[:100]}
@@ -777,6 +842,8 @@ async def update_memory(
     content: str | None = None,
     tags: TagList = None,
     metadata: MetaDict = None,
+    action_items: TagList = None,
+    memory_type: str | None = None,
 ) -> str:
     """
     Update an existing memory. Re-embeds automatically if content changes.
@@ -786,12 +853,19 @@ async def update_memory(
         content: New content (triggers re-embedding). Leave empty to keep existing.
         tags: New tags (replaces existing). Leave empty to keep existing.
         metadata: New metadata (merged with existing). Leave empty to keep existing.
+        action_items: Replace the memory's action items (same rules as
+            store_memory; [] clears them). Resets which items are resolved.
+            Leave empty to keep existing.
+        memory_type: Replace the memory's type. Leave empty to keep existing.
 
     Returns:
         Updated memory details, or not_found if the ID doesn't exist.
     """
     if content is not None and (err := _markup_error(content)):
         return json.dumps(err)
+    client_ai = _client_ai_metadata(action_items, memory_type)
+    if client_ai and client_ai.get("status") == "error":
+        return json.dumps(client_ai)
 
     db = await get_pool()
 
@@ -807,10 +881,13 @@ async def update_memory(
     idx = 2
 
     if content is not None and content != existing["content"]:
-        (embedding, truncated), ai_metadata = await asyncio.gather(
-            get_embedding(content, "doc"),
-            extract_metadata(content),
-        )
+        if client_ai is not None:
+            (embedding, truncated), ai_metadata = await get_embedding(content, "doc"), {}
+        else:
+            (embedding, truncated), ai_metadata = await asyncio.gather(
+                get_embedding(content, "doc"),
+                extract_metadata(content),
+            )
         ai_tags = [t.lower().strip() for t in ai_metadata.pop("topic_tags", [])]
 
         # If caller also provided tags, use those + AI tags; otherwise use existing + AI tags
@@ -842,6 +919,8 @@ async def update_memory(
             existing_meta.update(metadata)
         if ai_metadata:
             existing_meta["ai"] = ai_metadata
+        if client_ai is not None:
+            _apply_client_ai(existing_meta, client_ai)
         _embedding_meta(existing_meta, truncated)
         set_clauses.append(f"metadata = ${idx}::jsonb")
         params.append(json.dumps(existing_meta))
@@ -853,9 +932,11 @@ async def update_memory(
             params.append([t.lower().strip() for t in tags])
             idx += 1
 
-        if metadata is not None:
+        if metadata is not None or client_ai is not None:
             existing_meta = json.loads(existing["metadata"]) if existing["metadata"] else {}
-            existing_meta.update(metadata)
+            existing_meta.update(metadata or {})
+            if client_ai is not None:
+                _apply_client_ai(existing_meta, client_ai)
             set_clauses.append(f"metadata = ${idx}::jsonb")
             params.append(json.dumps(existing_meta))
             idx += 1
@@ -1337,6 +1418,8 @@ async def capture_webhook(request: Request) -> JSONResponse:
         source=body.get("source", "webhook"),
         tags=body.get("tags"),
         metadata=body.get("metadata"),
+        action_items=body.get("action_items"),
+        memory_type=body.get("memory_type"),
     )
     return JSONResponse(result, status_code=400 if result.get("status") == "error" else 200)
 
