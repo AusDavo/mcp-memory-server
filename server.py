@@ -447,6 +447,32 @@ async def _store_memory_impl(
     }
 
 
+# ─── Search Helpers ──────────────────────────────────────────────────────
+
+
+def _is_ident(token: str) -> bool:
+    """Identifier-like: 4+ chars and a letter+digit mix, or parts joined by
+    _ . : /, or 3+ hyphenated parts (so "third-party" doesn't count)."""
+    if len(token) < 4:
+        return False
+    if re.search(r"[A-Za-z]", token) and re.search(r"\d", token):
+        return True
+    if re.search(r"\w[_.:/]\w", token):
+        return True
+    return token.count("-") >= 2
+
+
+def _ident_tokens(query: str) -> list[str]:
+    words = (w.strip(",;()[]{}\"'?!`").rstrip(".") for w in query.split())
+    return [w for w in words if _is_ident(w)]
+
+
+def _ilike_pattern(token: str) -> str:
+    """Substring pattern with ILIKE's wildcards (and escape) taken literally."""
+    escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 # ─── Tools ───────────────────────────────────────────────────────────────
 
 
@@ -541,7 +567,9 @@ async def search_memory(
 
     Returns:
         List of matching memories ranked by fused relevance (score), with cosine
-        similarity and each list's rank (null if that list missed the memory).
+        similarity, each list's rank (null if that list missed the memory), and
+        keyword_mode: "identifier" when exact identifiers in the query matched,
+        "all_terms" when every query term matched, null for vector-only hits.
     """
     db = await get_pool()
     limit = min(limit, 50)
@@ -566,20 +594,29 @@ async def search_memory(
     if conditions:
         where_clause = "WHERE " + " AND ".join(conditions)
 
-    # Hybrid search: independent vector and keyword candidate lists, fused
-    # with reciprocal rank fusion. The keyword query ORs the terms (plainto
-    # ANDs them, which matches nothing for natural-language queries) while
-    # keeping stemming and stop-word removal; ts_rank_cd still favours
-    # memories that match more of the terms. Memories matching all terms rank
-    # first; normalisation 1 stops long documents winning on sheer length.
+    # Hybrid search: a vector candidate list fused with a keyword list by
+    # reciprocal rank fusion. The keyword list only admits strong matches;
+    # OR-matching every term (2026-09-29, 514d403) let memories that merely
+    # shared common words outvote the best vector hit, dropping paraphrase
+    # MRR@10 from 0.808 to 0.734. The keyword list is now one of:
+    #   identifier — the query has identifier-like tokens (hostnames, config
+    #     keys, hashes, error codes): memories containing all of them
+    #     verbatim, weighted 2x, since the English parser splits such tokens
+    #     into fragments that match everywhere.
+    #   all_terms — otherwise, or if no memory contains the identifiers:
+    #     memories matching every query term (stemmed, stop words dropped).
+    # Measured on 48 paraphrase + 53 identifier queries: paraphrase back to
+    # vector-only quality, identifier R@10 0.65 -> 1.00.
+    idents = _ident_tokens(query)
+    ident_where = "WHERE " + " AND ".join(conditions + [f"content ILIKE ALL(${param_idx}::text[])"])
+    params.append([_ilike_pattern(t) for t in idents])
     keyword_where = "WHERE " + " AND ".join(
         conditions + ["to_tsvector('english', content) @@ (SELECT q FROM kw_query)"]
     )
     rows = await db.fetch(
         f"""
         WITH kw_query AS (
-            SELECT replace(plainto_tsquery('english', $3)::text, '&', '|')::tsquery AS q,
-                   plainto_tsquery('english', $3) AS q_all
+            SELECT plainto_tsquery('english', $3) AS q
         ),
         vec AS (
             SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> $1::vector) AS rank
@@ -588,29 +625,47 @@ async def search_memory(
             ORDER BY embedding <=> $1::vector
             LIMIT $4
         ),
-        kw AS (
+        kw_ident AS (
             SELECT id, ts_rank_cd(to_tsvector('english', content), (SELECT q FROM kw_query), 1) AS fts_score,
                    ROW_NUMBER() OVER (
-                       ORDER BY to_tsvector('english', content) @@ (SELECT q_all FROM kw_query) DESC,
-                                ts_rank_cd(to_tsvector('english', content), (SELECT q FROM kw_query), 1) DESC
+                       ORDER BY ts_rank_cd(to_tsvector('english', content), (SELECT q FROM kw_query), 1) DESC,
+                                embedding <=> $1::vector
+                   ) AS rank
+            FROM memories
+            {ident_where} AND cardinality(${param_idx}::text[]) > 0
+            ORDER BY rank
+            LIMIT $4
+        ),
+        kw_all AS (
+            SELECT id, ts_rank_cd(to_tsvector('english', content), (SELECT q FROM kw_query), 1) AS fts_score,
+                   ROW_NUMBER() OVER (
+                       ORDER BY ts_rank_cd(to_tsvector('english', content), (SELECT q FROM kw_query), 1) DESC,
+                                embedding <=> $1::vector
                    ) AS rank
             FROM memories
             {keyword_where}
             ORDER BY rank
             LIMIT $4
         ),
+        kw AS (
+            SELECT id, fts_score, rank, 2.0 AS weight, 'identifier' AS mode FROM kw_ident
+            UNION ALL
+            SELECT id, fts_score, rank, 1.0, 'all_terms' FROM kw_all
+            WHERE NOT EXISTS (SELECT 1 FROM kw_ident)
+        ),
         fused AS (
             SELECT COALESCE(vec.id, kw.id) AS id,
                    vec.rank AS vector_rank,
                    kw.rank AS keyword_rank,
+                   kw.mode AS keyword_mode,
                    COALESCE(kw.fts_score, 0) AS fts_score,
                    COALESCE(1.0 / ({RRF_K} + vec.rank), 0)
-                     + COALESCE(1.0 / ({RRF_K} + kw.rank), 0) AS score
+                     + COALESCE(kw.weight / ({RRF_K} + kw.rank), 0) AS score
             FROM vec FULL OUTER JOIN kw ON vec.id = kw.id
         )
         SELECT m.id, m.content, m.source, m.tags, m.metadata, m.created_at,
                1 - (m.embedding <=> $1::vector) AS vector_score,
-               f.fts_score, f.vector_rank, f.keyword_rank, f.score
+               f.fts_score, f.vector_rank, f.keyword_rank, f.keyword_mode, f.score
         FROM fused f JOIN memories m ON m.id = f.id
         ORDER BY f.score DESC, vector_score DESC
         LIMIT $2
@@ -630,6 +685,7 @@ async def search_memory(
             "fts_score": round(float(row["fts_score"]), 4),
             "vector_rank": row["vector_rank"],
             "keyword_rank": row["keyword_rank"],
+            "keyword_mode": row["keyword_mode"],
             "created_at": row["created_at"].isoformat(),
         }
         for row in rows

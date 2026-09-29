@@ -17,7 +17,7 @@ Phone/browser ──HTTPS───────┘                  ▼
 - **Database**: Postgres 17 with pgvector — stores text alongside vector embeddings (1536 dims for OpenAI, 768 for nomic-embed-text) and the model that produced each one
 - **Server**: Python 3.13 + FastMCP — Streamable HTTP transport with Bearer token auth
 - **Embeddings**: OpenAI `text-embedding-3-small` by default, configurable to any OpenAI-compatible API or to Ollama's native API (see [Local embeddings](#local-embeddings-ollama)). The server refuses to start if the configured model doesn't match the stored vectors
-- **Search**: Hybrid — independent vector and keyword (OR-semantics full-text) candidate lists fused with reciprocal rank fusion (`RRF_K`, default 60)
+- **Search**: Hybrid — a vector candidate list fused by reciprocal rank fusion (`RRF_K`, default 60) with a keyword list that admits only strong matches: memories containing the query's identifier-like tokens verbatim (hostnames, config keys, hashes, error codes; weighted 2×), otherwise memories matching every query term. Each result's `keyword_mode` says which applied
 - **Metadata**: GPT-4o-mini extracts structured metadata (type, tags, entities, action items) in parallel with embedding — best-effort, never blocks storage
 - **Duplicate detection**: Cosine similarity check before insert (default threshold 0.95, configurable via `DUPLICATE_THRESHOLD`; the right value depends on the embedding model)
 - **Indexing**: HNSW (not IVFFlat) — works on empty tables
