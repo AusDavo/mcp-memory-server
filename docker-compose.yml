@@ -35,6 +35,7 @@ services:
       # docker-compose.override.yml, which is gitignored. Compose auto-merges it.
       DUPLICATE_THRESHOLD: ${DUPLICATE_THRESHOLD:-0.95}
       FIND_RELATED_THRESHOLD: ${FIND_RELATED_THRESHOLD:-0.85}
+      FIND_RELATED_NEIGHBORS: ${FIND_RELATED_NEIGHBORS:-10}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
       # Empty means the provider's default (OpenAI, or http://ollama:11434/api/embed).

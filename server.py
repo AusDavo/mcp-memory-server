@@ -31,6 +31,10 @@ ALL_TERMS_GATE = 10
 # higher (duplicate 0.975, related 0.90 — calibrated 2026-09-29).
 DUPLICATE_THRESHOLD = float(os.environ.get("DUPLICATE_THRESHOLD", "0.95"))
 FIND_RELATED_THRESHOLD = float(os.environ.get("FIND_RELATED_THRESHOLD", "0.85"))
+# find_related looks at each memory's K nearest neighbours (via the HNSW index)
+# rather than every pair, so work grows O(n·K) instead of O(n²). A pair is only
+# missed when both sides already have K closer neighbours above the threshold.
+FIND_RELATED_NEIGHBORS = max(1, min(100, int(os.environ.get("FIND_RELATED_NEIGHBORS", "10"))))
 
 # Embedding provider:
 #   openai — any OpenAI-compatible /v1/embeddings API (default)
@@ -1271,33 +1275,57 @@ async def find_related(
     threshold = max(0.7, min(0.99, threshold))
     limit = min(limit, 200)
 
-    conditions = ["m1.id < m2.id"]
-    params: list = [threshold, limit]
-    param_idx = 3
-
+    tag_filter_m1 = tag_filter_m2 = ""
+    params: list = [threshold, limit, FIND_RELATED_NEIGHBORS + 1]  # +1: each row finds itself
     if tags:
-        normalized = [t.lower().strip() for t in tags]
-        conditions.append(f"m1.tags @> ${param_idx}::text[]")
-        conditions.append(f"m2.tags @> ${param_idx}::text[]")
-        params.append(normalized)
-        param_idx += 1
+        params.append([t.lower().strip() for t in tags])
+        tag_filter_m1 = "AND m1.tags @> $4::text[]"
+        tag_filter_m2 = "WHERE m2.tags @> $4::text[]"
 
-    where_clause = " AND ".join(conditions)
-
-    rows = await db.fetch(
-        f"""
-        SELECT
-            m1.id AS id_a, m1.content AS content_a, m1.tags AS tags_a, m1.created_at AS created_a,
-            m2.id AS id_b, m2.content AS content_b, m2.tags AS tags_b, m2.created_at AS created_b,
-            1 - (m1.embedding <=> m2.embedding) AS similarity
-        FROM memories m1
-        JOIN memories m2 ON {where_clause}
-            AND 1 - (m1.embedding <=> m2.embedding) >= $1
-        ORDER BY similarity DESC
-        LIMIT $2
-        """,
-        *params,
-    )
+    # Per-row k-NN through the HNSW index, then dedupe a→b / b→a into pairs.
+    # The planner prices a seq scan (or, with tags, a GIN bitmap scan) + sort per
+    # row below the HNSW scan, which is O(n²) again and slower than the old
+    # self-join, so both are disabled for this transaction. Iterative scan keeps
+    # the index returning rows when the tag filter discards the nearest ones.
+    async with db.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL enable_seqscan = off")
+        await conn.execute("SET LOCAL enable_bitmapscan = off")
+        await conn.execute("SET LOCAL jit = off")
+        await conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
+        await conn.execute(f"SET LOCAL hnsw.ef_search = {max(40, FIND_RELATED_NEIGHBORS + 1)}")
+        rows = await conn.fetch(
+            f"""
+            WITH edges AS (
+                SELECT LEAST(m1.id, nb.id) AS id_a, GREATEST(m1.id, nb.id) AS id_b, nb.similarity
+                FROM memories m1
+                CROSS JOIN LATERAL (
+                    SELECT m2.id, 1 - (m1.embedding <=> m2.embedding) AS similarity
+                    FROM memories m2
+                    {tag_filter_m2}
+                    ORDER BY m1.embedding <=> m2.embedding
+                    LIMIT $3
+                ) nb
+                WHERE m1.embedding IS NOT NULL {tag_filter_m1}
+                  AND nb.id <> m1.id AND nb.similarity >= $1
+            ),
+            pairs AS (
+                SELECT id_a, id_b, MAX(similarity) AS similarity
+                FROM edges
+                GROUP BY id_a, id_b
+                ORDER BY similarity DESC
+                LIMIT $2
+            )
+            SELECT
+                a.id AS id_a, a.content AS content_a, a.tags AS tags_a, a.created_at AS created_a,
+                b.id AS id_b, b.content AS content_b, b.tags AS tags_b, b.created_at AS created_b,
+                p.similarity
+            FROM pairs p
+            JOIN memories a ON a.id = p.id_a
+            JOIN memories b ON b.id = p.id_b
+            ORDER BY p.similarity DESC
+            """,
+            *params,
+        )
 
     if not rows:
         return json.dumps({"threshold": threshold, "clusters": [], "total_clusters": 0, "total_memories_in_clusters": 0})

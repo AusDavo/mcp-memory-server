@@ -32,7 +32,7 @@ Phone/browser ──HTTPS───────┘                  ▼
 | `list_recent` | List the last N memories, optionally filtered by source |
 | `delete_memory` | Remove a memory by UUID |
 | `update_memory` | Update content, tags, metadata, `action_items` or `memory_type` on an existing memory. Re-embeds automatically if content changes. |
-| `find_related` | Find clusters of semantically similar memories — candidates for consolidation. Uses union-find clustering. |
+| `find_related` | Find clusters of semantically similar memories — candidates for consolidation. Checks each memory's nearest neighbours via the HNSW index, then union-find clusters the pairs. |
 | `weekly_review` | Summarize the last N days: grouped by date, type/tag distribution, open action items. Pass `include_resolved=true` to also see resolved items. |
 | `resolve_action_items` | Mark action items on a memory as done (by 0-based index into `metadata.ai.action_items`). Persists to `metadata.ai.resolved_indices`. |
 | `unresolve_action_items` | Reverse a previous `resolve_action_items` call — remove indices from the resolved list. |
@@ -84,6 +84,7 @@ MCP_API_KEY=<generate-with-openssl-rand-hex-32>
 # Optional — similarity thresholds. These are model-specific (see Local embeddings):
 # DUPLICATE_THRESHOLD=0.95         # store rejects a near-duplicate at or above this
 # FIND_RELATED_THRESHOLD=0.85      # find_related default
+# FIND_RELATED_NEIGHBORS=10        # nearest neighbours find_related checks per memory (1-100)
 
 # Optional — reciprocal rank fusion constant for hybrid search (default 60):
 # RRF_K=60
