@@ -422,6 +422,7 @@ def _apply_client_ai(meta: dict, client_ai: dict) -> None:
     ai = meta.get("ai") or {}
     if "action_items" in client_ai and client_ai["action_items"] != ai.get("action_items"):
         ai.pop("resolved_indices", None)
+        ai.pop("resolutions", None)
     ai.update(client_ai)
     meta["ai"] = ai
 
@@ -977,8 +978,25 @@ async def update_memory(
     )
 
 
+def _action_item_state(action_items: list, resolved: list[int], resolutions: dict) -> dict:
+    """Open/resolved split for tool responses; resolved items carry their note."""
+    resolved_set = set(resolved)
+    return {
+        "open": [{"index": i, "text": t} for i, t in enumerate(action_items) if i not in resolved_set],
+        "resolved": [
+            {"index": i, "text": action_items[i], **resolutions.get(str(i), {})}
+            for i in resolved if i < len(action_items)
+        ],
+    }
+
+
 @mcp.tool()
-async def resolve_action_items(memory_id: str, indices: IntList) -> str:
+async def resolve_action_items(
+    memory_id: str,
+    indices: IntList,
+    reason: str | None = None,
+    evidence_id: str | None = None,
+) -> str:
     """
     Mark action items on a memory as resolved (done / no longer open).
 
@@ -990,6 +1008,10 @@ async def resolve_action_items(memory_id: str, indices: IntList) -> str:
     Args:
         memory_id: UUID of the memory whose action items to resolve.
         indices: 0-based indices into metadata.ai.action_items to mark resolved.
+        reason: Optional short note on why (e.g. "done: shipped in PR #12",
+                "superseded: decided against"). Stored per index in
+                metadata.ai.resolutions so the closure can be audited later.
+        evidence_id: Optional UUID of a memory that shows the item was done.
 
     Returns:
         Updated open/resolved state for that memory, plus any invalid indices ignored.
@@ -1018,6 +1040,16 @@ async def resolve_action_items(memory_id: str, indices: IntList) -> str:
     merged = sorted(existing_resolved | valid_new)
 
     ai["resolved_indices"] = merged
+    if reason or evidence_id:
+        resolutions = ai.get("resolutions") or {}
+        note = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        if reason:
+            note["reason"] = reason
+        if evidence_id:
+            note["evidence_id"] = evidence_id
+        for i in valid_new:
+            resolutions[str(i)] = note
+        ai["resolutions"] = resolutions
     meta["ai"] = ai
 
     await db.execute(
@@ -1026,19 +1058,10 @@ async def resolve_action_items(memory_id: str, indices: IntList) -> str:
         json.dumps(meta),
     )
 
-    resolved_set = set(merged)
-    open_items = [
-        {"index": i, "text": t} for i, t in enumerate(action_items) if i not in resolved_set
-    ]
-    resolved_items = [
-        {"index": i, "text": action_items[i]} for i in merged
-    ]
-
     return json.dumps({
         "status": "updated",
         "id": memory_id,
-        "open": open_items,
-        "resolved": resolved_items,
+        **_action_item_state(action_items, merged, ai.get("resolutions") or {}),
         "invalid_indices": invalid,
     })
 
@@ -1071,6 +1094,13 @@ async def unresolve_action_items(memory_id: str, indices: IntList) -> str:
     merged = sorted(existing_resolved - set(indices))
 
     ai["resolved_indices"] = merged
+    resolutions = ai.get("resolutions") or {}
+    for i in indices:
+        resolutions.pop(str(i), None)
+    if resolutions:
+        ai["resolutions"] = resolutions
+    else:
+        ai.pop("resolutions", None)
     meta["ai"] = ai
 
     await db.execute(
@@ -1079,19 +1109,10 @@ async def unresolve_action_items(memory_id: str, indices: IntList) -> str:
         json.dumps(meta),
     )
 
-    resolved_set = set(merged)
-    open_items = [
-        {"index": i, "text": t} for i, t in enumerate(action_items) if i not in resolved_set
-    ]
-    resolved_items = [
-        {"index": i, "text": action_items[i]} for i in merged
-    ]
-
     return json.dumps({
         "status": "updated",
         "id": memory_id,
-        "open": open_items,
-        "resolved": resolved_items,
+        **_action_item_state(action_items, merged, resolutions),
     })
 
 
@@ -1165,6 +1186,7 @@ async def weekly_review(
             }
             if idx in resolved_indices:
                 record["resolved"] = True
+                record.update((ai.get("resolutions") or {}).get(str(idx), {}))
                 resolved_action_items.append(record)
             else:
                 open_action_items.append(record)

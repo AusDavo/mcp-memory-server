@@ -34,7 +34,7 @@ Phone/browser ──HTTPS───────┘                  ▼
 | `update_memory` | Update content, tags, metadata, `action_items` or `memory_type` on an existing memory. Re-embeds automatically if content changes. |
 | `find_related` | Find clusters of semantically similar memories — candidates for consolidation. Checks each memory's nearest neighbours via the HNSW index, then union-find clusters the pairs. |
 | `weekly_review` | Summarize the last N days: grouped by date, type/tag distribution, open action items. Pass `include_resolved=true` to also see resolved items. |
-| `resolve_action_items` | Mark action items on a memory as done (by 0-based index into `metadata.ai.action_items`). Persists to `metadata.ai.resolved_indices`. |
+| `resolve_action_items` | Mark action items on a memory as done (by 0-based index into `metadata.ai.action_items`). Persists to `metadata.ai.resolved_indices`; an optional `reason` and `evidence_id` are kept per item in `metadata.ai.resolutions`. |
 | `unresolve_action_items` | Reverse a previous `resolve_action_items` call — remove indices from the resolved list. |
 | `memory_stats` | Aggregate dashboard: totals, sources, top tags, 30-day activity |
 
