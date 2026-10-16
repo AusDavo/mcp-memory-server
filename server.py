@@ -55,7 +55,16 @@ EMBEDDING_MAX_TOKENS = int(os.environ.get("EMBEDDING_MAX_TOKENS", "2048"))
 # Generous: Ollama serves one request at a time, so a 20-memory batch queues.
 EMBEDDING_TIMEOUT = float(os.environ.get("EMBEDDING_TIMEOUT", "120"))
 
+# Own handler rather than basicConfig: root at INFO would also surface every
+# httpx request line. Without one, info/warning logs are silently dropped.
 logger = logging.getLogger("memory-server")
+logger.setLevel(logging.INFO)
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+)
+logger.addHandler(_log_handler)
+logger.propagate = False
 
 # ─── Multi-Token Auth ───────────────────────────────────────────────────
 # Build a mapping of token → forced source.
