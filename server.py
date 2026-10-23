@@ -35,6 +35,12 @@ FIND_RELATED_THRESHOLD = float(os.environ.get("FIND_RELATED_THRESHOLD", "0.85"))
 # rather than every pair, so work grows O(n·K) instead of O(n²). A pair is only
 # missed when both sides already have K closer neighbours above the threshold.
 FIND_RELATED_NEIGHBORS = max(1, min(100, int(os.environ.get("FIND_RELATED_NEIGHBORS", "10"))))
+# A store returns the earlier memories at or above this similarity, so the
+# session that wrote an outcome can close the plan it finishes while it still
+# knows the answer. 0 turns it off. For nomic, 0.85 is the memory gardener's
+# cut and returned ~1.4 memories per store over a week (2026-10-24).
+RELATED_ON_STORE_THRESHOLD = float(os.environ.get("RELATED_ON_STORE_THRESHOLD", "0.85"))
+RELATED_ON_STORE_LIMIT = 5
 
 # Embedding provider:
 #   openai — any OpenAI-compatible /v1/embeddings API (default)
@@ -143,7 +149,12 @@ mcp = FastMCP(
     instructions=(
         "Personal semantic memory layer. Store and search memories across all your AI tools. "
         "When storing, pass action_items only for concrete follow-ups the user still has to do "
-        "(most memories have none), and memory_type when it's clear."
+        "(most memories have none), and memory_type when it's clear. "
+        "A store may return related_earlier: earlier memories close to the new one. If the new "
+        "memory finishes or changes one of them, fix it in the same turn: resolve_action_items "
+        "with evidence_id set to the new memory's id for items it completes, and update_memory "
+        "with a dated first line (\"STATUS YYYY-MM-DD: shipped, see <id>\") where its text now "
+        "reads as open or wrong. Leave them alone when they are merely related."
     ),
 )
 
@@ -503,7 +514,7 @@ async def _store_memory_impl(
         json.dumps(metadata),
     )
 
-    return {
+    result = {
         "status": "stored",
         "id": str(row["id"]),
         "created_at": row["created_at"].isoformat(),
@@ -511,6 +522,51 @@ async def _store_memory_impl(
         "ai_metadata": ai_metadata if ai_metadata else None,
         "content_preview": content[:100],
     }
+    if related := await _related_earlier(db, embedding, row["id"], row["created_at"]):
+        result["related_earlier"] = related
+    return result
+
+
+async def _related_earlier(db: asyncpg.Pool, embedding: list[float], new_id, created_at) -> list[dict]:
+    """Earlier memories close to a just-stored one, with their open action items.
+
+    Best-effort: a failure here must not turn a successful store into an error.
+    """
+    if RELATED_ON_STORE_THRESHOLD <= 0:
+        return []
+    try:
+        rows = await db.fetch(
+            """
+            SELECT id, content, created_at, metadata,
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM memories
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2
+            """,
+            str(embedding),
+            RELATED_ON_STORE_LIMIT + 1,  # +1: the new memory finds itself
+        )
+    except Exception:
+        logger.exception("related_earlier lookup failed")
+        return []
+    related = []
+    for r in rows:
+        if r["id"] == new_id or r["created_at"] >= created_at:
+            continue
+        if r["similarity"] is None or float(r["similarity"]) < RELATED_ON_STORE_THRESHOLD:
+            continue
+        ai = (json.loads(r["metadata"]) if r["metadata"] else {}).get("ai") or {}
+        item = {
+            "id": str(r["id"]),
+            "created_at": r["created_at"].isoformat(),
+            "similarity": round(float(r["similarity"]), 4),
+            "content_preview": r["content"][:200],
+        }
+        state = _action_item_state(ai.get("action_items") or [], ai.get("resolved_indices") or [], {})
+        if state["open"]:
+            item["open_action_items"] = state["open"]
+        related.append(item)
+    return related[:RELATED_ON_STORE_LIMIT]
 
 
 # ─── Search Helpers ──────────────────────────────────────────────────────
@@ -570,7 +626,10 @@ async def store_memory(
             person_note, meeting. Optional.
 
     Returns:
-        Confirmation with the memory ID.
+        Confirmation with the memory ID. May include related_earlier: earlier
+        memories close to this one, with any open action items. If this memory
+        finishes or changes one of them, resolve its items (evidence_id = this
+        memory's id) or give it a dated STATUS first line via update_memory.
     """
     result = await _store_memory_impl(
         content, source, tags, metadata, force=force,

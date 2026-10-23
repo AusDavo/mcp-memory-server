@@ -20,6 +20,7 @@ Phone/browser ──HTTPS───────┘                  ▼
 - **Search**: Hybrid — a vector candidate list fused by reciprocal rank fusion (`RRF_K`, default 60) with a keyword list that admits only strong matches: memories containing the query's identifier-like tokens verbatim (hostnames, config keys, hashes, error codes; weighted 2×), otherwise memories matching every query term, provided they are also in the vector top 10 (so long memories can't get in on word count alone). Each result's `keyword_mode` says which applied
 - **Metadata**: the calling client can pass a memory's `action_items` and `memory_type`. Otherwise, if `OPENAI_API_KEY` is set, GPT-4o-mini extracts them (plus tags and entities); it's best-effort and never blocks storage
 - **Duplicate detection**: Cosine similarity check before insert (default threshold 0.95, configurable via `DUPLICATE_THRESHOLD`; the right value depends on the embedding model)
+- **Related on store**: a successful store also returns `related_earlier`: up to 5 earlier memories at or above `RELATED_ON_STORE_THRESHOLD` (default 0.85), each with its open action items. Memories go stale when a session saves "PR1 shipped" and leaves "PR1 not started" reading as open; the session that wrote the outcome is the cheapest place to close the plan, so the server instructions ask it to resolve the items (`evidence_id` = the new memory) or add a dated STATUS line. Best-effort: a failed lookup never fails the store
 - **Indexing**: HNSW (not IVFFlat) — works on empty tables
 
 ## Tools
@@ -85,6 +86,7 @@ MCP_API_KEY=<generate-with-openssl-rand-hex-32>
 # DUPLICATE_THRESHOLD=0.95         # store rejects a near-duplicate at or above this
 # FIND_RELATED_THRESHOLD=0.85      # find_related default
 # FIND_RELATED_NEIGHBORS=10        # nearest neighbours find_related checks per memory (1-100)
+# RELATED_ON_STORE_THRESHOLD=0.85  # store returns earlier memories at or above this (0 = off)
 
 # Optional — reciprocal rank fusion constant for hybrid search (default 60):
 # RRF_K=60
