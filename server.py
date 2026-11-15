@@ -11,6 +11,8 @@ from uuid import UUID
 import asyncpg
 import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.middleware import Middleware as StarletteMiddleware
@@ -107,6 +109,97 @@ auth_source_override: contextvars.ContextVar[str | None] = contextvars.ContextVa
     "auth_source_override", default=None
 )
 
+# ─── Per-Key Tool Policy ────────────────────────────────────────────────
+# Optional limits on a scoped key, by its <NAME>:
+#   MCP_KEY_TOOLS_<NAME>=search_memory      → only these tools are listed or
+#                                             callable (comma-separated)
+#   MCP_KEY_TAGS_<NAME>=project-x           → every search is limited to
+#                                             memories with these tags, and
+#                                             every store adds them
+# A key with no MCP_KEY_TOOLS_<NAME> keeps every tool. A restricted key can
+# use /webhook/capture only if store_memory is among its tools.
+#
+# Tag limits apply only to tools that filter by tag, so a key with
+# MCP_KEY_TAGS_<NAME> may list only TAG_SCOPED_TOOLS.
+
+TAG_SCOPED_TOOLS = {"search_memory", "store_memory", "store_memories"}
+
+
+def _env_list(name: str) -> list[str]:
+    return [v.strip() for v in os.environ.get(name, "").split(",") if v.strip()]
+
+
+KEY_TOOL_POLICY: dict[str, set[str]] = {}
+KEY_TAG_SCOPE: dict[str, list[str]] = {}
+
+for _source in {s for s in TOKEN_SOURCE_MAP.values() if s}:
+    _tools = _env_list(f"MCP_KEY_TOOLS_{_source.upper()}")
+    _tags = _env_list(f"MCP_KEY_TAGS_{_source.upper()}")
+    if _tags and not _tools:
+        raise RuntimeError(
+            f"MCP_KEY_TAGS_{_source.upper()} needs MCP_KEY_TOOLS_{_source.upper()}: "
+            "a tag limit only holds for tools that filter by tag"
+        )
+    if _tags and not set(_tools) <= TAG_SCOPED_TOOLS:
+        raise RuntimeError(
+            f"MCP_KEY_TAGS_{_source.upper()} is set, so MCP_KEY_TOOLS_{_source.upper()} "
+            f"may list only {sorted(TAG_SCOPED_TOOLS)}"
+        )
+    if _tools:
+        KEY_TOOL_POLICY[_source] = set(_tools)
+        logger.info("Key %s limited to tools: %s", _source, ", ".join(sorted(_tools)))
+    if _tags:
+        KEY_TAG_SCOPE[_source] = _tags
+        logger.info("Key %s limited to tags: %s", _source, ", ".join(_tags))
+
+
+def _allowed_tools() -> set[str] | None:
+    """Tools the current request's key may use; None means all of them."""
+    source = auth_source_override.get()
+    return KEY_TOOL_POLICY.get(source) if source else None
+
+
+def _merge_tags(tags: object, scope: list[str]) -> list[str]:
+    tags = _coerce_json_list(tags)
+    given = [t for t in tags if isinstance(t, str)] if isinstance(tags, list) else []
+    return given + [t for t in scope if t not in given]
+
+
+class KeyPolicyMiddleware(Middleware):
+    """Applies MCP_KEY_TOOLS_<NAME> and MCP_KEY_TAGS_<NAME> to scoped keys."""
+
+    async def on_list_tools(self, context, call_next):
+        tools = await call_next(context)
+        allowed = _allowed_tools()
+        if allowed is None:
+            return tools
+        return [t for t in tools if t.name in allowed]
+
+    async def on_call_tool(self, context, call_next):
+        allowed = _allowed_tools()
+        if allowed is None:
+            return await call_next(context)
+        name = context.message.name
+        if name not in allowed:
+            raise ToolError(f"This key may not call {name}")
+        scope = KEY_TAG_SCOPE.get(auth_source_override.get() or "")
+        if scope:
+            args = dict(context.message.arguments or {})
+            if name == "store_memories":
+                mems = _coerce_json_list(args.get("memories"))
+                if isinstance(mems, list):
+                    args["memories"] = [
+                        {**m, "tags": _merge_tags(m.get("tags"), scope)}
+                        if isinstance(m, dict) else m
+                        for m in mems
+                    ]
+            else:
+                args["tags"] = _merge_tags(args.get("tags"), scope)
+            context = context.copy(
+                message=context.message.model_copy(update={"arguments": args})
+            )
+        return await call_next(context)
+
 # ─── Authentication Middleware (Starlette layer) ────────────────────────
 
 
@@ -157,6 +250,7 @@ mcp = FastMCP(
         "reads as open or wrong. Leave them alone when they are merely related."
     ),
 )
+mcp.add_middleware(KeyPolicyMiddleware())
 
 # ─── Database Pool ───────────────────────────────────────────────────────
 
@@ -1520,6 +1614,9 @@ async def capture_webhook(request: Request) -> JSONResponse:
 
     Auth is handled by the Starlette BearerAuthMiddleware.
     """
+    allowed = _allowed_tools()
+    if allowed is not None and "store_memory" not in allowed:
+        return JSONResponse({"error": "This key may not store memories"}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -1531,10 +1628,15 @@ async def capture_webhook(request: Request) -> JSONResponse:
             {"error": "Missing or invalid 'content' field"}, status_code=400
         )
 
+    tags = body.get("tags")
+    scope = KEY_TAG_SCOPE.get(auth_source_override.get() or "")
+    if scope:
+        tags = _merge_tags(tags, scope)
+
     result = await _store_memory_impl(
         content=content,
         source=body.get("source", "webhook"),
-        tags=body.get("tags"),
+        tags=tags,
         metadata=body.get("metadata"),
         action_items=body.get("action_items"),
         memory_type=body.get("memory_type"),
