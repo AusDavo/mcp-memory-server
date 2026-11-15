@@ -219,6 +219,21 @@ services:
 
 The suffix after `MCP_API_KEY_` becomes the forced source name (lowercased). The token values themselves live only in your untracked `.env`.
 
+#### Limiting a scoped key
+
+Two optional variables narrow what a scoped key can do, keyed by the same `<NAME>`:
+
+```yaml
+      MCP_KEY_TOOLS_<NAME>: search_memory   # only these tools (comma-separated)
+      MCP_KEY_TAGS_<NAME>: project-x        # searches see only memories with these tags; stores add them
+```
+
+- With `MCP_KEY_TOOLS_<NAME>` set, the key lists and calls only those tools. Any other call fails before it reaches the database. `/webhook/capture` is refused unless `store_memory` is in the list.
+- `MCP_KEY_TAGS_<NAME>` is merged into every search's `tags` filter (which matches memories carrying all of them), so the key can't see memories outside the tag. It needs `MCP_KEY_TOOLS_<NAME>`, limited to `search_memory`, `store_memory` and `store_memories`. Other read tools don't filter by tag, and the server refuses to start if one is listed.
+- A key with neither variable keeps every tool, as before.
+
+For a search-only key for an agent you don't fully trust, set `MCP_KEY_TOOLS_<NAME>: search_memory`. To let it add notes later without letting it change or delete anything, add `store_memory`. Its writes still carry `source="<name>"`, so they're easy to find and remove.
+
 ## MCP client compatibility
 
 Some MCP clients (including Claude Code) double-serialise structured parameters — sending `'["a","b"]'` (a JSON string) instead of `["a","b"]` (a native array). The server handles this transparently using Pydantic `BeforeValidator` on all `list` and `dict` parameters, so tags and metadata work regardless of client behaviour.
