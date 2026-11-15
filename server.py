@@ -114,15 +114,19 @@ auth_source_override: contextvars.ContextVar[str | None] = contextvars.ContextVa
 #   MCP_KEY_TOOLS_<NAME>=search_memory      → only these tools are listed or
 #                                             callable (comma-separated)
 #   MCP_KEY_TAGS_<NAME>=project-x           → every search is limited to
-#                                             memories with these tags, and
-#                                             every store adds them
+#                                             memories with these tags
 # A key with no MCP_KEY_TOOLS_<NAME> keeps every tool. A restricted key can
 # use /webhook/capture only if store_memory is among its tools.
 #
-# Tag limits apply only to tools that filter by tag, so a key with
-# MCP_KEY_TAGS_<NAME> may list only TAG_SCOPED_TOOLS.
+# Tag limits hold only for tools that filter every read by tag, so a key
+# with MCP_KEY_TAGS_<NAME> may list only TAG_SCOPED_TOOLS. Stores are not
+# among them: the duplicate check and related_earlier search the whole
+# table and return previews, which would leak memories outside the tag.
+#
+# The server refuses to start on a limit variable that matches no key, or
+# on a tool name that isn't registered, so a typo can't fail open.
 
-TAG_SCOPED_TOOLS = {"search_memory", "store_memory", "store_memories"}
+TAG_SCOPED_TOOLS = {"search_memory"}
 
 
 def _env_list(name: str) -> list[str]:
@@ -131,6 +135,14 @@ def _env_list(name: str) -> list[str]:
 
 KEY_TOOL_POLICY: dict[str, set[str]] = {}
 KEY_TAG_SCOPE: dict[str, list[str]] = {}
+
+_scoped_names = {s.upper() for s in TOKEN_SOURCE_MAP.values() if s}
+for _var in os.environ:
+    for _prefix in ("MCP_KEY_TOOLS_", "MCP_KEY_TAGS_"):
+        if _var.startswith(_prefix) and _var.removeprefix(_prefix) not in _scoped_names:
+            raise RuntimeError(
+                f"{_var} matches no MCP_API_KEY_<NAME> key (names are upper case)"
+            )
 
 for _source in {s for s in TOKEN_SOURCE_MAP.values() if s}:
     _tools = _env_list(f"MCP_KEY_TOOLS_{_source.upper()}")
@@ -185,16 +197,7 @@ class KeyPolicyMiddleware(Middleware):
         scope = KEY_TAG_SCOPE.get(auth_source_override.get() or "")
         if scope:
             args = dict(context.message.arguments or {})
-            if name == "store_memories":
-                mems = _coerce_json_list(args.get("memories"))
-                if isinstance(mems, list):
-                    args["memories"] = [
-                        {**m, "tags": _merge_tags(m.get("tags"), scope)}
-                        if isinstance(m, dict) else m
-                        for m in mems
-                    ]
-            else:
-                args["tags"] = _merge_tags(args.get("tags"), scope)
+            args["tags"] = _merge_tags(args.get("tags"), scope)
             context = context.copy(
                 message=context.message.model_copy(update={"arguments": args})
             )
@@ -1628,15 +1631,10 @@ async def capture_webhook(request: Request) -> JSONResponse:
             {"error": "Missing or invalid 'content' field"}, status_code=400
         )
 
-    tags = body.get("tags")
-    scope = KEY_TAG_SCOPE.get(auth_source_override.get() or "")
-    if scope:
-        tags = _merge_tags(tags, scope)
-
     result = await _store_memory_impl(
         content=content,
         source=body.get("source", "webhook"),
-        tags=tags,
+        tags=body.get("tags"),
         metadata=body.get("metadata"),
         action_items=body.get("action_items"),
         memory_type=body.get("memory_type"),
@@ -1685,6 +1683,19 @@ def quick_capture(text: str, context: str = "") -> str:
         "Then call `store_memory` with these values. Return the result to the user."
     )
     return prompt
+
+
+# ─── Key Policy Check ────────────────────────────────────────────────────
+# Runs once all tools are registered: a misspelt tool name would otherwise
+# leave a key with fewer tools than its log line claims.
+
+_registered_tools = {t.name for t in asyncio.run(mcp.list_tools())}
+for _source, _tools in KEY_TOOL_POLICY.items():
+    _unknown = _tools - _registered_tools
+    if _unknown:
+        raise RuntimeError(
+            f"MCP_KEY_TOOLS_{_source.upper()} names unknown tools: {sorted(_unknown)}"
+        )
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────

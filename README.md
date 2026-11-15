@@ -225,14 +225,15 @@ Two optional variables narrow what a scoped key can do, keyed by the same `<NAME
 
 ```yaml
       MCP_KEY_TOOLS_<NAME>: search_memory   # only these tools (comma-separated)
-      MCP_KEY_TAGS_<NAME>: project-x        # searches see only memories with these tags; stores add them
+      MCP_KEY_TAGS_<NAME>: project-x        # searches see only memories with these tags
 ```
 
 - With `MCP_KEY_TOOLS_<NAME>` set, the key lists and calls only those tools. Any other call fails before it reaches the database. `/webhook/capture` is refused unless `store_memory` is in the list.
-- `MCP_KEY_TAGS_<NAME>` is merged into every search's `tags` filter (which matches memories carrying all of them), so the key can't see memories outside the tag. It needs `MCP_KEY_TOOLS_<NAME>`, limited to `search_memory`, `store_memory` and `store_memories`. Other read tools don't filter by tag, and the server refuses to start if one is listed.
+- `MCP_KEY_TAGS_<NAME>` is merged into every search's `tags` filter (which matches memories carrying all of them), so the key can't see memories outside the tag. It needs `MCP_KEY_TOOLS_<NAME>: search_memory` and nothing else. No other tool filters every read by tag. Stores can't be listed either: their duplicate check and `related_earlier` search the whole table and return previews, which would show memories outside the tag.
+- The server refuses to start if a limit variable matches no `MCP_API_KEY_<NAME>` (names are upper case), or if a tool name isn't registered. A typo can't leave a key with more access than intended.
 - A key with neither variable keeps every tool, as before.
 
-For a search-only key for an agent you don't fully trust, set `MCP_KEY_TOOLS_<NAME>: search_memory`. To let it add notes later without letting it change or delete anything, add `store_memory`. Its writes still carry `source="<name>"`, so they're easy to find and remove.
+For a search-only key for an agent you don't fully trust, set `MCP_KEY_TOOLS_<NAME>: search_memory`, with a tag if it should see only part of the store. A key without a tag limit can also be given `store_memory` to add notes without changing or deleting anything. Its writes carry `source="<name>"`, so they're easy to find and remove, but its store replies can show previews of any memory.
 
 ## MCP client compatibility
 
